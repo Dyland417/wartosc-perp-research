@@ -1,0 +1,38 @@
+version: 1
+
+project:
+  timezone: UTC
+  data_directory: data
+
+database:
+  # Relative paths use the working directory for the packaged default and the
+  # configuration file's directory when WARTOSC_CONFIG_PATH is provided.
+  # SQLite is for local research; PostgreSQL is the expected scale-up path.
+  url: sqlite:///data/wartosc.db
+  echo: false
+
+exchanges:
+  hyperliquid:
+    adapter: wartosc_perp_research.collectors.hyperliquid.HyperliquidCollector
+    enabled: false
+    rate_limit_per_second: 5
+    options: {}
+
+  binance:
+    adapter: wartosc_perp_research.collectors.binance.BinanceCollector
+    enabled: false
+    rate_limit_per_second: 5
+    options: {}
+
+  variational:
+    adapter: wartosc_perp_research.collectors.variational.VariationalCollector
+    enabled: false
+    rate_limit_per_second: 2
+    options: {}
+
+  lighter:
+    adapter: wartosc_perp_research.collectors.lighter.LighterCollector
+    enabled: false
+    rate_limit_per_second: 2
+    options: {}
+

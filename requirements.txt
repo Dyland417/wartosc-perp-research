@@ -1,0 +1,3 @@
+# One command installs the package plus the intentionally small research/test toolset.
+-e .[research,dev]
+

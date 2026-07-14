@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wartosc-perp-research"
+version = "0.1.0"
+description = "Research infrastructure for cryptocurrency perpetual futures markets."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Wartosc Perp Research contributors" }]
+keywords = ["cryptocurrency", "perpetual-futures", "quantitative-research"]
+dependencies = [
+    "numpy>=2.0,<3",
+    "pandas>=2.2,<3",
+    "PyYAML>=6.0,<7",
+    "scipy>=1.13,<2",
+    "SQLAlchemy>=2.0,<3",
+]
+
+[project.optional-dependencies]
+research = ["jupyterlab>=4.2,<5"]
+dev = [
+    "pytest>=8,<9",
+    "pytest-cov>=6,<8",
+    "ruff>=0.15,<1",
+]
+
+[project.urls]
+Repository = "https://github.com/Dyland417/wartosc-perp-research"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+wartosc_perp_research = ["resources/*.yaml"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+xfail_strict = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.coverage.run]
+branch = true
+source = ["wartosc_perp_research"]
+
+[tool.coverage.report]
+fail_under = 80
+precision = 1
+show_missing = true
+skip_covered = true
