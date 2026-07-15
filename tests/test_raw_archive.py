@@ -22,7 +22,7 @@ def test_raw_archive_is_atomic_partitioned_and_idempotent(tmp_path: Path) -> Non
     second = archive.archive(**values)
 
     assert first == second
-    assert "hyperliquid\\funding_history\\2026\\02\\03" in str(first)
+    assert first.parent == tmp_path / "hyperliquid" / "funding_history" / "2026" / "02" / "03"
     assert len(list(tmp_path.rglob("*.json"))) == 1
     assert not list(tmp_path.rglob("*.tmp"))
     envelope = json.loads(first.read_text(encoding="utf-8"))
