@@ -64,6 +64,17 @@ def _positive_decimal(value: Decimal | str | int | float | None, field_name: str
     return normalized
 
 
+def _nonnegative_decimal(
+    value: Decimal | str | int | float | None, field_name: str
+) -> Decimal | None:
+    if value is None:
+        return None
+    normalized = _decimal(value, field_name)
+    if normalized < 0:
+        raise ValueError(f"'{field_name}' must not be negative")
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class InstrumentRecord:
     exchange: str
@@ -113,6 +124,7 @@ class FundingRateRecord:
     is_predicted: bool = False
     mark_price: Decimal | None = None
     index_price: Decimal | None = None
+    premium: Decimal | None = None
     received_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
@@ -125,6 +137,8 @@ class FundingRateRecord:
             raise ValueError("'interval_seconds' must be positive")
         object.__setattr__(self, "mark_price", _positive_decimal(self.mark_price, "mark_price"))
         object.__setattr__(self, "index_price", _positive_decimal(self.index_price, "index_price"))
+        if self.premium is not None:
+            object.__setattr__(self, "premium", _decimal(self.premium, "premium"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,9 +149,14 @@ class MarketSnapshotRecord:
     mark_price: Decimal | None = None
     index_price: Decimal | None = None
     oracle_price: Decimal | None = None
+    mid_price: Decimal | None = None
+    previous_day_price: Decimal | None = None
     last_price: Decimal | None = None
     open_interest: Decimal | None = None
     volume_24h: Decimal | None = None
+    funding_rate: Decimal | None = None
+    premium: Decimal | None = None
+    event_time_source: str = "exchange"
     received_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
@@ -149,13 +168,25 @@ class MarketSnapshotRecord:
             "mark_price",
             "index_price",
             "oracle_price",
+            "mid_price",
+            "previous_day_price",
             "last_price",
-            "open_interest",
-            "volume_24h",
         ):
             object.__setattr__(
                 self, field_name, _positive_decimal(getattr(self, field_name), field_name)
             )
+        for field_name in ("open_interest", "volume_24h"):
+            object.__setattr__(
+                self, field_name, _nonnegative_decimal(getattr(self, field_name), field_name)
+            )
+        for field_name in ("funding_rate", "premium"):
+            if getattr(self, field_name) is not None:
+                object.__setattr__(
+                    self, field_name, _decimal(getattr(self, field_name), field_name)
+                )
+        object.__setattr__(
+            self, "event_time_source", _text(self.event_time_source, "event_time_source")
+        )
 
 
 @dataclass(frozen=True, slots=True)

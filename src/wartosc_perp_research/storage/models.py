@@ -135,6 +135,7 @@ class FundingRate(Base):
     is_predicted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     mark_price: Mapped[Decimal | None] = _decimal_column()
     index_price: Mapped[Decimal | None] = _decimal_column()
+    premium: Mapped[Decimal | None] = _decimal_column()
     ingestion_run_id: Mapped[int | None] = mapped_column(
         ForeignKey("ingestion_runs.id", ondelete="SET NULL")
     )
@@ -161,9 +162,14 @@ class MarketSnapshot(Base):
     mark_price: Mapped[Decimal | None] = _decimal_column()
     index_price: Mapped[Decimal | None] = _decimal_column()
     oracle_price: Mapped[Decimal | None] = _decimal_column()
+    mid_price: Mapped[Decimal | None] = _decimal_column()
+    previous_day_price: Mapped[Decimal | None] = _decimal_column()
     last_price: Mapped[Decimal | None] = _decimal_column()
     open_interest: Mapped[Decimal | None] = _decimal_column()
     volume_24h: Mapped[Decimal | None] = _decimal_column()
+    funding_rate: Mapped[Decimal | None] = _decimal_column()
+    premium: Mapped[Decimal | None] = _decimal_column()
+    event_time_source: Mapped[str] = mapped_column(String(32), nullable=False)
     ingestion_run_id: Mapped[int | None] = mapped_column(
         ForeignKey("ingestion_runs.id", ondelete="SET NULL")
     )

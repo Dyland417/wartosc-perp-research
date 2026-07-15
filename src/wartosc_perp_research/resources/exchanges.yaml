@@ -15,8 +15,14 @@ exchanges:
   hyperliquid:
     adapter: wartosc_perp_research.collectors.hyperliquid.HyperliquidCollector
     enabled: false
-    rate_limit_per_second: 5
-    options: {}
+    # Most info requests cost 20 weight against a 1,200 weight/minute limit.
+    # Stay below the theoretical one-request/second ceiling for headroom.
+    rate_limit_per_second: 0.5
+    options:
+      api_url: https://api.hyperliquid.xyz/info
+      timeout_seconds: 15
+      max_retries: 3
+      funding_interval_seconds: 3600
 
   binance:
     adapter: wartosc_perp_research.collectors.binance.BinanceCollector
@@ -35,4 +41,3 @@ exchanges:
     enabled: false
     rate_limit_per_second: 2
     options: {}
-

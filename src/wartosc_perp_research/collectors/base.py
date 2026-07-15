@@ -78,6 +78,12 @@ class ExchangeCollector(ABC):
         del symbol
         raise UnsupportedCapabilityError(f"{self.exchange} does not support market snapshots")
 
+    async def fetch_market_snapshots(
+        self, symbols: Sequence[str] | None = None
+    ) -> Sequence[MarketSnapshotRecord]:
+        del symbols
+        raise UnsupportedCapabilityError(f"{self.exchange} does not support market snapshots")
+
     async def fetch_order_book(self, symbol: str, depth: int) -> OrderBookSnapshotRecord:
         del symbol, depth
         raise UnsupportedCapabilityError(f"{self.exchange} does not support order books")

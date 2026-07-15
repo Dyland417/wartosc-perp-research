@@ -14,11 +14,11 @@ The Phase 1 structure therefore uses an installable `src/` package while keeping
 
 ### Configuration
 
-The package resource `wartosc_perp_research/resources/exchanges.yaml` contains versioned, non-secret defaults. `load_settings()` validates the document into immutable dataclasses, requires UTC, resolves packaged-default paths from the current working directory, and permits narrow environment overrides. A custom YAML supplied through `WARTOSC_CONFIG_PATH` resolves relative paths from its own directory. A later CLI and scheduler should consume the same settings object.
+The package resource `wartosc_perp_research/resources/exchanges.yaml` contains versioned, non-secret defaults. `load_settings()` validates the document into immutable dataclasses, requires UTC, resolves packaged-default paths from the current working directory, and permits narrow environment overrides. A custom YAML supplied through `WARTOSC_CONFIG_PATH` resolves relative paths from its own directory. The CLI consumes this same settings object; a future scheduler should do so as well.
 
 ### Collectors
 
-An exchange adapter owns transport details, pagination, throttling, and vendor payload parsing. Its output is an exchange-neutral domain record. It must not write SQL, compute signals, or silently repair questionable source data.
+An exchange adapter owns transport details, pagination, retry/backoff, and vendor payload parsing. Its output is an exchange-neutral domain record. It must not write SQL, compute signals, or silently repair questionable source data. Its request boundary can accept a raw-response sink so a successful response is archived before parsing and persistence.
 
 Instrument discovery is mandatory. Funding history, market snapshots, and order books are optional capabilities because exchanges differ and incomplete adapters should fail explicitly. The interface is asynchronous to support network-bound collection without requiring a particular HTTP client in Phase 1.
 
@@ -26,7 +26,7 @@ Instrument discovery is mandatory. Funding history, market snapshots, and order 
 
 Domain records are the normalization seam between APIs and storage. They use `Decimal` for prices, rates, and quantities; reject non-finite or invalid values; require timezone-aware timestamps; and canonicalize time to UTC.
 
-`event_time` is the exchange timestamp. `received_at` is the local observation timestamp. Storage adds `ingested_at`. Preserving all three allows latency and staleness analysis instead of overwriting one clock with another.
+`event_time` is normally the exchange timestamp. `received_at` is the local observation timestamp. Storage adds `ingested_at`. If a response has no timestamp, the record uses receipt time and stores an explicit `event_time_source`; this is the case for Hyperliquid market snapshots. Preserving clock provenance avoids silently inventing exchange time.
 
 ### Storage
 
@@ -39,12 +39,14 @@ The Phase 1 schema includes:
 | `exchanges` | Stable venue identity and metadata |
 | `instruments` | Point-in-time contract universe, lifecycle, increments, multiplier |
 | `ingestion_runs` | Dataset lineage, cursor, record count, failure state |
-| `funding_rates` | Actual/predicted rates, interval, associated mark/index prices |
-| `market_snapshots` | Mark, index, oracle, last, open interest, 24h volume |
+| `funding_rates` | Actual/predicted rates, interval, premium, associated mark/index prices |
+| `market_snapshots` | Mark, index, oracle, mid, prior-day price, funding, premium, open interest, 24h volume, clock source |
 | `order_book_snapshots` | Snapshot timing, depth, sequence, checksum |
 | `order_book_levels` | Ordered bid/ask price and quantity levels |
 
-Composite uniqueness constraints provide an idempotency target for deterministic observations. Database values use fixed precision. Foreign keys, checks, and lookup indexes protect basic research integrity.
+Composite uniqueness constraints provide an idempotency target for deterministic observations. The ingestion service also performs portable select-before-insert checks, so bounded batches work on SQLite and PostgreSQL without dialect-specific upserts. Database values use fixed precision. Foreign keys, checks, and lookup indexes protect basic research integrity.
+
+Raw payloads are independent of relational storage. Each successful response is wrapped with its request, UTC receipt time, dataset, schema version, and SHA-256 digest, then atomically written to a date-partitioned JSON path. This preserves replay and parser-audit capability without coupling collectors to a database.
 
 ### Research, strategies, and backtests
 
@@ -54,11 +56,8 @@ Notebooks are consumers, not architecture. Reusable estimators and transformatio
 
 Phase 1 deliberately leaves these unimplemented:
 
-- a reference exchange adapter and HTTP transport policy;
-- an ingestion application that upserts normalized records atomically;
-- append-only raw payload storage for replay and parser audits;
 - schema migrations and PostgreSQL deployment configuration;
-- data-quality checks for gaps, duplicates, stale clocks, and outliers;
+- scheduled gap and continuity checks across successive collection runs;
 - symbol/contract mapping across venues and a historical instrument universe;
 - trades, candles, liquidations, borrow rates, spot prices, and dated futures;
 - query/repository APIs that return point-in-time research frames;
@@ -74,11 +73,11 @@ Establish packaging, configuration, normalized domain contracts, the first datab
 
 Exit criterion: a fake collector can produce normalized data; the schema builds in a clean database; invalid timestamps and duplicate observations fail predictably.
 
-### Phase 2 — One reliable data path
+### Phase 2 — One reliable data path (Hyperliquid vertical implemented)
 
-Implement one well-documented exchange adapter, starting with instrument metadata and historical funding before adding current market snapshots. Add a transport wrapper with timeouts, retry/backoff, throttling, response capture, and explicit source timestamps. Add an ingestion service, idempotent writes, raw append-only storage, Alembic migrations, and a small CLI.
+The Hyperliquid vertical implements instrument metadata, paginated historical funding, current market snapshots, a minimal retrying transport, raw response capture, explicit timestamp provenance, deterministic quality gates, idempotent writes, ingestion lineage, and a small CLI. Rate limiting currently relies on bounded sequential requests plus retry/backoff; centralized throttling belongs with a scheduler. Alembic is deferred until the pre-1.0 schema has a deployed database that needs in-place upgrades.
 
-Exit criterion: a bounded date range can be collected twice without duplicate curated rows, replayed from raw payloads, and audited through an ingestion run.
+Exit criterion met locally: a bounded date range can be collected twice without duplicate curated rows, raw payloads are retained for replay, and every attempt is audited through an ingestion run. Continuous live-operation validation remains part of Phase 6.
 
 ### Phase 3 — Funding research vertical
 

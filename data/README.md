@@ -2,5 +2,4 @@
 
 This directory is the default local landing zone for databases, raw responses, and derived datasets. Its contents are ignored by Git because market data is large, mutable, and often subject to redistribution constraints.
 
-Raw API payloads should eventually be stored append-only under a date/exchange/dataset partition. Curated tables belong in the normalized database. Neither should be committed to the source repository.
-
+The collector stores raw API envelopes append-only under `raw/<exchange>/<dataset>/YYYY/MM/DD/`. Each envelope includes its request, response, receipt time, schema version, and payload digest. Curated records belong in the normalized database. Neither form should be committed to the source repository.
