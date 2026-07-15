@@ -50,7 +50,9 @@ Raw payloads are independent of relational storage. Each successful response is 
 
 ### Research, strategies, and backtests
 
-Notebooks are consumers, not architecture. Reusable estimators and transformations graduate into `wartosc_perp_research.research` with tests. Strategies should consume point-in-time features and emit desired exposures or signals; they should not issue orders. Backtests should later own clock progression, portfolio accounting, fees, slippage, funding cash flows, margin, liquidation rules, and capacity.
+Notebooks are consumers, not architecture. Reusable estimators and transformations graduate into `wartosc_perp_research.research` with tests. The funding research vertical separates pure calculations (`funding.py`), exchange-event-time queries (`funding_repository.py`), and deterministic serialization (`funding_report.py`). Reports contain no generation timestamp, never fill gaps, and serialize Decimal results as strings so identical inputs produce identical bytes.
+
+Strategies should consume point-in-time features and emit desired exposures or signals; they should not issue orders. Backtests should later own clock progression, portfolio accounting, fees, slippage, funding cash flows, margin, liquidation rules, and capacity. The current funding study is explicitly not a backtest.
 
 ## Missing components
 
@@ -60,7 +62,7 @@ Phase 1 deliberately leaves these unimplemented:
 - scheduled gap and continuity checks across successive collection runs;
 - symbol/contract mapping across venues and a historical instrument universe;
 - trades, candles, liquidations, borrow rates, spot prices, and dated futures;
-- query/repository APIs that return point-in-time research frames;
+- general query APIs beyond the bounded actual-funding repository;
 - fee, slippage, capacity, margin, and liquidation models;
 - reproducible dataset manifests and notebook execution;
 - monitoring, retries, scheduling, and data retention policies.
@@ -79,11 +81,37 @@ The Hyperliquid vertical implements instrument metadata, paginated historical fu
 
 Exit criterion met locally: a bounded date range can be collected twice without duplicate curated rows, raw payloads are retained for replay, and every attempt is audited through an ingestion run. Continuous live-operation validation remains part of Phase 6.
 
-### Phase 3 — Funding research vertical
+### Phase 3 — Funding research workflow MVP (implemented)
 
-Add a second exchange only after the reference path is stable. Build symbol mapping, funding-interval normalization, annualized funding measures, cross-venue spreads, gap/staleness tests, fee schedules, and a reproducible funding notebook/report. Preserve inactive instruments to avoid survivorship bias.
+The MVP selects cached actual Hyperliquid funding observations by default, or explicitly collects
+and ingests them with `--collect`, then validates an hourly grid and produces reproducible JSON and
+Markdown reports. A documented one-second alignment tolerance accommodates Hyperliquid's
+subsecond event-time jitter while preserving original timestamps. Multiple rows mapping to one
+tolerated grid slot fail analysis so duplicates cannot affect statistics. Exchange event time is
+the only research clock; receipt and ingestion times are excluded. Predicted rows are excluded,
+boundaries are start-inclusive/end-exclusive, and missing or irregular observations are reported
+without imputation. Rows declaring a non-hourly funding interval remain visible as irregular input
+but are excluded from hourly statistics and hourly coverage.
 
-Exit criterion: a historical funding spread study can be reproduced from a versioned query with no forward-filled future information.
+All financial calculations use `Decimal` under a controlled precision context; binary float input
+is rejected at the research boundary. Percentiles use deterministic linear interpolation and
+standard deviation is the population statistic. Simple annualization is mean observed hourly
+funding multiplied by 8,760 (365 × 24), never compounding. Positive funding means longs pay and
+shorts receive; negative funding reverses direction. Net cash-flow fields use positive for received
+and negative for paid. These extrapolations are not forecasts and do not claim persistence or
+achievability.
+
+Reports contain no generation clock, so identical analytical inputs are byte-identical. Existing
+different report files require `--overwrite`, while identical content is an idempotent write. A
+valid incomplete study exits zero with prominent warnings; invalid requests and output conflicts
+exit two; collection, storage, and data-integrity failures exit one and do not masquerade as a
+complete study.
+
+A later extension may add symbol mapping, funding-interval normalization across venues, fee schedules, and cross-venue spreads only after this single-venue workflow is reviewed. No second exchange belongs in this MVP.
+
+Exit criterion met for the single-venue MVP: identical windows over identical curated rows produce
+byte-identical reports with no forward-filled observations, ambiguous duplicates, or hidden
+generation timestamps. Cross-venue spread research remains deferred.
 
 ### Phase 4 — Basis and microstructure
 

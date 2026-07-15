@@ -64,7 +64,7 @@ class UrllibInfoTransport:
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "wartosc-perp-research/0.2",
+                "User-Agent": "wartosc-perp-research/0.3",
             },
             method="POST",
         )

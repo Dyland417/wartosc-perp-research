@@ -21,6 +21,9 @@ The first Phase 2 vertical is now implemented for Hyperliquid's unauthenticated 
 - quality-gated, idempotent SQLAlchemy ingestion with run lineage;
 - a `wpr` CLI for database setup and bounded collection.
 
+Phase 3 adds the first research-facing workflow: deterministic completeness checks and
+descriptive funding-rate reports generated from actual Hyperliquid event timestamps.
+
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
 ## Architecture
@@ -63,6 +66,9 @@ src/wartosc_perp_research/
   domain/models.py                     normalized records
   ingestion/service.py                 quality-gated idempotent writes
   quality.py                           deterministic pre-write checks
+  research/funding.py                  pure funding statistics and completeness analysis
+  research/funding_repository.py       event-time funding queries
+  research/funding_report.py           deterministic JSON and Markdown reports
   resources/exchanges.yaml             packaged non-secret defaults
   storage/database.py                  engine and transaction lifecycle
   storage/models.py                    relational schema
@@ -115,6 +121,50 @@ wpr hyperliquid snapshots --symbol BTC --symbol ETH
 Funding event times come from Hyperliquid. `metaAndAssetCtxs` does not provide an exchange timestamp, so market snapshots use the local UTC receipt time and persist `event_time_source=received_at`. Funding uniqueness is `(instrument, event_time, is_predicted)`; snapshot uniqueness is `(instrument, event_time)`. Repeating a funding range therefore records a new ingestion run but skips already-curated observations.
 
 The CLI intentionally requires an explicit funding time range and coin list. This keeps exploratory pulls bounded and makes provenance obvious. Use `--config path/to/exchanges.yaml` before the command to select a custom database or data directory.
+
+## Funding research workflow
+
+Analyze actual funding already stored in the configured database:
+
+```text
+wpr research funding \
+  --symbols BTC ETH \
+  --start 2026-01-01T00:00:00Z \
+  --end 2026-07-01T00:00:00Z \
+  --output outputs/funding-study
+```
+
+Database-only analysis is the default. Add `--collect` to fetch and idempotently ingest the
+bounded range before querying the database; a failed collection exits without writing a study.
+The window is start-inclusive, end-exclusive, and must align to UTC hours. Reports are written as
+`funding-study.json` and `funding-study.md`. Repeated runs over identical inputs produce identical
+bytes. Existing files with different results are protected unless `--overwrite` is supplied.
+
+The workflow reports observation coverage, missing and irregular hourly events, mean, median,
+population standard deviation, simple annualization, sign percentages, percentiles, positive and
+negative streaks, signed long/short funding cash flows, monthly/hour-of-day summaries, and extremes.
+Missing events are never filled. Only actual rates are selected; predicted funding is excluded.
+Generated files under `outputs/` are ignored by Git.
+
+Hyperliquid event times can include small millisecond offsets around the hour. Completeness uses an
+explicit one-second alignment tolerance while preserving the original exchange timestamp in every
+observation and report. Two records that map to the same tolerated hourly slot are rejected rather
+than double-counted. A source row declaring a non-hourly interval is shown as irregular but is
+excluded from hourly statistics and does not satisfy hourly coverage.
+
+This is descriptive funding research, not a backtest. The annualized figure is the observed mean
+hourly rate multiplied by exactly 8,760 observations per 365-day year without compounding. It is
+not a forecast and must not be interpreted as achievable or persistent. Standard deviation is the
+population standard deviation of the observed rows. Positive funding means longs pay and shorts
+receive; negative funding means shorts pay and longs receive. Cash-flow fields use positive for
+received and negative for paid. The report does not model price or basis changes, fees, slippage,
+liquidity, margin, liquidation, latency, or execution.
+
+CLI exit codes distinguish request validity from data completeness: `0` means a valid study was
+written (including a study with prominently reported missing data), `1` means collection,
+configuration, database, or data-integrity failure, and `2` means an invalid research request or
+unsafe/conflicting output path. A syntactically valid symbol with no cached rows is an incomplete
+study, not an invalid request.
 
 ## Developer checks
 

@@ -29,6 +29,8 @@ reports/*
 research/outputs/
 work/
 outputs/
+funding-study.json
+funding-study.md
 
 # Local databases.
 *.db

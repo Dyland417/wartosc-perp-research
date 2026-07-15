@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,8 +15,20 @@ from wartosc_perp_research.collectors import TimeRange
 from wartosc_perp_research.collectors.hyperliquid import HyperliquidCollector
 from wartosc_perp_research.config import Settings, load_settings
 from wartosc_perp_research.ingestion import IngestionResult, IngestionService
+from wartosc_perp_research.research import (
+    ReportOutputError,
+    analyze_funding_study,
+    load_actual_funding_observations,
+    write_funding_report,
+)
 from wartosc_perp_research.storage import Database
 from wartosc_perp_research.storage.raw_archive import RawArchive
+
+_RESEARCH_SYMBOL = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_-]{0,127}\Z")
+
+
+class ResearchRequestError(ValueError):
+    """An invalid research request, reported with exit code 2."""
 
 
 def _timestamp(value: str) -> datetime:
@@ -48,6 +61,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     snapshots = hyperliquid_commands.add_parser("snapshots", help="Ingest a market snapshot")
     snapshots.add_argument("--symbol", action="append", help="Optional symbol filter")
+
+    research = commands.add_parser("research", help="Run reproducible research workflows")
+    research_commands = research.add_subparsers(dest="research_command", required=True)
+    research_funding = research_commands.add_parser(
+        "funding", help="Analyze observed Hyperliquid funding rates"
+    )
+    research_funding.add_argument("--symbols", nargs="+", required=True)
+    research_funding.add_argument("--start", type=_timestamp, required=True)
+    research_funding.add_argument("--end", type=_timestamp, required=True)
+    research_funding.add_argument("--output", type=Path, required=True)
+    research_funding.add_argument(
+        "--collect",
+        action="store_true",
+        help="Collect and ingest first (default: use only rows already in the database)",
+    )
+    research_funding.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing report files when their contents differ",
+    )
     return parser
 
 
@@ -110,6 +143,100 @@ async def _run_hyperliquid(args: argparse.Namespace, settings: Settings) -> dict
         database.dispose()
 
 
+async def _collect_research_funding(
+    settings: Settings,
+    database: Database,
+    symbols: list[str],
+    start: datetime,
+    end: datetime,
+) -> IngestionResult:
+    collector = _collector(settings)
+    service = IngestionService(database, collector.exchange, collector=type(collector).__name__)
+    try:
+        service.sync_instruments(await collector.fetch_instruments())
+        records = [
+            record async for record in collector.iter_funding_rates(TimeRange(start, end), symbols)
+        ]
+        return service.ingest_funding_rates(records)
+    finally:
+        await collector.close()
+
+
+def _run_funding_research(args: argparse.Namespace, settings: Settings) -> dict[str, Any]:
+    symbols = sorted({symbol.strip() for symbol in args.symbols if symbol.strip()})
+    if not symbols:
+        raise ResearchRequestError("At least one symbol is required")
+    invalid_symbols = [symbol for symbol in symbols if not _RESEARCH_SYMBOL.fullmatch(symbol)]
+    if invalid_symbols:
+        raise ResearchRequestError("Invalid Hyperliquid symbol(s): " + ", ".join(invalid_symbols))
+    if args.end <= args.start:
+        raise ResearchRequestError("'end' must be after 'start'")
+    if any(
+        (
+            args.start.minute,
+            args.start.second,
+            args.start.microsecond,
+            args.end.minute,
+            args.end.second,
+            args.end.microsecond,
+        )
+    ):
+        raise ResearchRequestError("Research windows must be aligned to UTC hour boundaries")
+
+    output_directory = args.output.expanduser().resolve()
+    database = Database(settings.database.url, echo=settings.database.echo)
+    database.create_schema()
+    collection_result = None
+    try:
+        if args.collect:
+            collection_result = asyncio.run(
+                _collect_research_funding(settings, database, symbols, args.start, args.end)
+            )
+        observations = load_actual_funding_observations(
+            database,
+            exchange="hyperliquid",
+            symbols=symbols,
+            start=args.start,
+            end=args.end,
+        )
+        study = analyze_funding_study(
+            exchange="hyperliquid",
+            symbols=symbols,
+            start=args.start,
+            end=args.end,
+            observations=observations,
+        )
+        try:
+            paths = write_funding_report(study, output_directory, overwrite=args.overwrite)
+        except ReportOutputError as exc:
+            raise ResearchRequestError(str(exc)) from exc
+    finally:
+        database.dispose()
+    data_warnings = {
+        result.symbol: list(result.warnings) for result in study.instruments if result.warnings
+    }
+    output = {
+        "status": "incomplete_data" if data_warnings else "complete",
+        "study_type": "observed_funding_rate_descriptive_analysis",
+        "dataset_source": "collected_and_database" if args.collect else "database",
+        "observation_counts": {
+            result.symbol: result.observation_count for result in study.instruments
+        },
+        "statistics_observation_counts": {
+            result.symbol: result.statistics_observation_count for result in study.instruments
+        },
+        "missing_expected_observation_counts": {
+            result.symbol: len(result.missing_timestamps) for result in study.instruments
+        },
+        "data_warnings": data_warnings,
+        "json_report": str(paths.json_path),
+        "markdown_report": str(paths.markdown_path),
+    }
+    if collection_result is not None:
+        output["collection"] = _result(collection_result)
+    return output
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -121,8 +248,13 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 database.dispose()
             output: dict[str, Any] = {"status": "ok", "database": settings.database.url}
-        else:
+        elif args.command == "hyperliquid":
             output = asyncio.run(_run_hyperliquid(args, settings))
+        else:
+            output = _run_funding_research(args, settings)
+    except ResearchRequestError as exc:
+        print(json.dumps({"status": "invalid_request", "error": str(exc)}), file=sys.stderr)
+        return 2
     except Exception as exc:
         print(json.dumps({"status": "error", "error": str(exc)}), file=sys.stderr)
         return 1
