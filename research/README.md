@@ -24,3 +24,30 @@ Annualization is the observed mean hourly rate multiplied by 8,760, is simple ra
 compounded, and is not evidence that the rate is achievable or persistent. Reported standard
 deviation is the population statistic. Price and basis changes, fees, slippage, liquidity, margin,
 liquidation, latency, and execution are outside this workflow.
+
+Historical candle exports are also available without a notebook:
+
+```text
+wpr research prices --symbols BTC ETH --interval 1h \
+  --start 2026-07-01T00:00:00Z --end 2026-07-08T00:00:00Z \
+  --output outputs/price-study
+```
+
+The deterministic CSV contains only completed exchange-provided `candleSnapshot` OHLCV rows. A
+candle closes at the inclusive exchange millisecond `T` and becomes eligible at `T + 1ms`. All 14
+native UTC interval grids are supported, including variable-length calendar `1M`; collection uses
+calendar-aware chunks of at most 500 slots but can never recover candles older than the venue's
+separate latest-5,000 retention cap. Raw responses are archived as `price_candles` before parsing.
+
+The library repository defaults to strict `observed` knowledge time, requiring exchange completion,
+receipt, and ingestion by the cutoff. This CLI intentionally exports `finalized_retrospective` data
+so later backfills remain usable. Its artifacts carry that mode and warn that Hyperliquid supplies
+neither revision history nor proof of when a backfilled candle first became observable. Conflicting
+recollections fail and leave the first curated row unchanged; the raw responses remain available.
+
+Coverage JSON and Markdown identify gaps without filling them, and the manifest hashes the exact
+bytes of every data artifact. Repeated identical runs are byte-stable. Existing different outputs
+require `--overwrite`, while roots, symbolic-link path components, and non-regular targets are
+rejected. Candle values are exact `NUMERIC(38,18)`-representable Decimals, and OHLC is not a mark,
+index, oracle, mid, or execution price. Add `--collect` only when the public API should be queried
+before the cached retrospective export. This workflow contains no P&L, backtest, or Phase 4B code.

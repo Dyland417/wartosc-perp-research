@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from types import MappingProxyType
@@ -20,6 +20,115 @@ class InstrumentKind(StrEnum):
 class OrderBookSide(StrEnum):
     BID = "bid"
     ASK = "ask"
+
+
+class CandleInterval(StrEnum):
+    ONE_MINUTE = "1m"
+    THREE_MINUTES = "3m"
+    FIVE_MINUTES = "5m"
+    FIFTEEN_MINUTES = "15m"
+    THIRTY_MINUTES = "30m"
+    ONE_HOUR = "1h"
+    TWO_HOURS = "2h"
+    FOUR_HOURS = "4h"
+    EIGHT_HOURS = "8h"
+    TWELVE_HOURS = "12h"
+    ONE_DAY = "1d"
+    THREE_DAYS = "3d"
+    ONE_WEEK = "1w"
+    ONE_MONTH = "1M"
+
+    @property
+    def seconds(self) -> int | None:
+        """Return the fixed interval length; calendar months intentionally have none."""
+
+        return {
+            CandleInterval.ONE_MINUTE: 60,
+            CandleInterval.THREE_MINUTES: 180,
+            CandleInterval.FIVE_MINUTES: 300,
+            CandleInterval.FIFTEEN_MINUTES: 900,
+            CandleInterval.THIRTY_MINUTES: 1_800,
+            CandleInterval.ONE_HOUR: 3_600,
+            CandleInterval.TWO_HOURS: 7_200,
+            CandleInterval.FOUR_HOURS: 14_400,
+            CandleInterval.EIGHT_HOURS: 28_800,
+            CandleInterval.TWELVE_HOURS: 43_200,
+            CandleInterval.ONE_DAY: 86_400,
+            CandleInterval.THREE_DAYS: 259_200,
+            CandleInterval.ONE_WEEK: 604_800,
+            CandleInterval.ONE_MONTH: None,
+        }[self]
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_MONDAY_EPOCH = datetime(1970, 1, 5, tzinfo=UTC)
+CANDLE_DECIMAL_PRECISION = 38
+CANDLE_DECIMAL_SCALE = 18
+
+
+def is_candle_open_time(value: datetime, interval: CandleInterval | str) -> bool:
+    """Return whether ``value`` is on Hyperliquid's native UTC candle grid.
+
+    Fixed intervals through three days are Unix-epoch anchored, weekly candles are
+    Monday-00:00 UTC anchored, and monthly candles begin at 00:00 UTC on day one.
+    """
+
+    value = ensure_utc(value, "value")
+    interval = CandleInterval(interval)
+    if interval is CandleInterval.ONE_MONTH:
+        return (
+            value.day == 1
+            and value.hour == 0
+            and value.minute == 0
+            and value.second == 0
+            and value.microsecond == 0
+        )
+    anchor = _MONDAY_EPOCH if interval is CandleInterval.ONE_WEEK else _EPOCH
+    delta = value - anchor
+    elapsed_microseconds = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+    return elapsed_microseconds % (interval.seconds * 1_000_000) == 0
+
+
+def shift_candle_time(value: datetime, interval: CandleInterval | str, steps: int) -> datetime:
+    """Shift a native UTC candle boundary by a signed number of intervals."""
+
+    value = ensure_utc(value, "value")
+    interval = CandleInterval(interval)
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        raise ValueError("'steps' must be an integer")
+    if not is_candle_open_time(value, interval):
+        raise ValueError(
+            f"'{value.isoformat()}' is not a native {interval.value} UTC candle boundary"
+        )
+    if interval.seconds is not None:
+        return value + timedelta(seconds=interval.seconds * steps)
+    month_index = value.year * 12 + (value.month - 1) + steps
+    year, zero_based_month = divmod(month_index, 12)
+    if not 1 <= year <= 9999:
+        raise ValueError("Shifted monthly candle boundary is outside datetime range")
+    return value.replace(year=year, month=zero_based_month + 1)
+
+
+def advance_candle_time(
+    value: datetime, interval: CandleInterval | str, steps: int = 1
+) -> datetime:
+    """Advance a UTC candle boundary without approximating calendar months."""
+
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+        raise ValueError("'steps' must be a nonnegative integer")
+    return shift_candle_time(value, interval, steps)
+
+
+def candle_available_time(open_time: datetime, interval: CandleInterval | str) -> datetime:
+    """Return the first instant after Hyperliquid's inclusive close millisecond."""
+
+    return shift_candle_time(open_time, interval, 1)
+
+
+def candle_close_time(open_time: datetime, interval: CandleInterval | str) -> datetime:
+    """Return Hyperliquid's inclusive millisecond candle close timestamp."""
+
+    return candle_available_time(open_time, interval) - timedelta(milliseconds=1)
 
 
 def ensure_utc(value: datetime, field_name: str = "timestamp") -> datetime:
@@ -72,6 +181,35 @@ def _nonnegative_decimal(
     normalized = _decimal(value, field_name)
     if normalized < 0:
         raise ValueError(f"'{field_name}' must not be negative")
+    return normalized
+
+
+def _candle_decimal(
+    value: Decimal | str | int | float,
+    field_name: str,
+    *,
+    positive: bool,
+) -> Decimal:
+    if isinstance(value, (bool, float)):
+        raise TypeError(f"'{field_name}' must not use binary floating-point")
+    normalized = _decimal(value, field_name)
+    if normalized < 0 or (positive and normalized == 0):
+        qualifier = "positive" if positive else "nonnegative"
+        raise ValueError(f"'{field_name}' must be {qualifier}")
+    _, decimal_digits, decimal_exponent = normalized.as_tuple()
+    significant_digits = list(decimal_digits)
+    while significant_digits and significant_digits[-1] == 0 and decimal_exponent < 0:
+        significant_digits.pop()
+        decimal_exponent += 1
+    fractional_digits = 0 if not normalized else max(-decimal_exponent, 0)
+    integer_digits = 0 if not normalized else max(len(significant_digits) + decimal_exponent, 0)
+    if fractional_digits > CANDLE_DECIMAL_SCALE or integer_digits > (
+        CANDLE_DECIMAL_PRECISION - CANDLE_DECIMAL_SCALE
+    ):
+        raise ValueError(
+            f"'{field_name}' exceeds NUMERIC({CANDLE_DECIMAL_PRECISION}, "
+            f"{CANDLE_DECIMAL_SCALE}) without exact representation"
+        )
     return normalized
 
 
@@ -139,6 +277,61 @@ class FundingRateRecord:
         object.__setattr__(self, "index_price", _positive_decimal(self.index_price, "index_price"))
         if self.premium is not None:
             object.__setattr__(self, "premium", _decimal(self.premium, "premium"))
+
+
+@dataclass(frozen=True, slots=True)
+class CandleRecord:
+    """One completed exchange-provided OHLCV candle.
+
+    Prices retain the meaning supplied by the candle endpoint. They are not renamed
+    or interpreted as mark, index, oracle, mid, or executable prices.
+    """
+
+    exchange: str
+    symbol: str
+    interval: CandleInterval
+    open_time: datetime
+    close_time: datetime
+    open_price: Decimal
+    high_price: Decimal
+    low_price: Decimal
+    close_price: Decimal
+    volume: Decimal
+    trade_count: int
+    price_source: str
+    received_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "exchange", _text(self.exchange, "exchange", lower=True))
+        object.__setattr__(self, "symbol", _text(self.symbol, "symbol"))
+        object.__setattr__(self, "interval", CandleInterval(self.interval))
+        object.__setattr__(self, "open_time", ensure_utc(self.open_time, "open_time"))
+        object.__setattr__(self, "close_time", ensure_utc(self.close_time, "close_time"))
+        object.__setattr__(self, "received_at", ensure_utc(self.received_at, "received_at"))
+        if not is_candle_open_time(self.open_time, self.interval):
+            raise ValueError(
+                f"'open_time' must be on the native {self.interval.value} UTC candle grid"
+            )
+        if self.close_time <= self.open_time:
+            raise ValueError("'close_time' must be after 'open_time'")
+        for field_name in ("open_price", "high_price", "low_price", "close_price"):
+            object.__setattr__(
+                self,
+                field_name,
+                _candle_decimal(getattr(self, field_name), field_name, positive=True),
+            )
+        object.__setattr__(self, "volume", _candle_decimal(self.volume, "volume", positive=False))
+        if (
+            isinstance(self.trade_count, bool)
+            or not isinstance(self.trade_count, int)
+            or self.trade_count < 0
+        ):
+            raise ValueError("'trade_count' must be a nonnegative integer")
+        if self.high_price < max(self.open_price, self.close_price, self.low_price):
+            raise ValueError("'high_price' must be the greatest OHLC price")
+        if self.low_price > min(self.open_price, self.close_price, self.high_price):
+            raise ValueError("'low_price' must be the least OHLC price")
+        object.__setattr__(self, "price_source", _text(self.price_source, "price_source"))
 
 
 @dataclass(frozen=True, slots=True)

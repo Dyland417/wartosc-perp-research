@@ -25,6 +25,7 @@ def test_schema_contains_foundation_tables() -> None:
             "market_snapshots",
             "order_book_levels",
             "order_book_snapshots",
+            "price_candles",
         }
     finally:
         database.dispose()

@@ -12,11 +12,18 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from wartosc_perp_research.domain import (
+    CandleRecord,
     FundingRateRecord,
     InstrumentRecord,
     MarketSnapshotRecord,
 )
-from wartosc_perp_research.quality import DataQualityChecks, QualityReport
+from wartosc_perp_research.quality import (
+    DataQualityChecks,
+    DataQualityError,
+    QualityIssue,
+    QualityReport,
+    Severity,
+)
 from wartosc_perp_research.storage import (
     Database,
     Exchange,
@@ -24,6 +31,7 @@ from wartosc_perp_research.storage import (
     IngestionRun,
     Instrument,
     MarketSnapshot,
+    PriceCandle,
 )
 
 
@@ -185,6 +193,70 @@ class IngestionService:
 
         return self._execute("market_snapshots", report, write)
 
+    def ingest_candles(self, records: list[CandleRecord]) -> IngestionResult:
+        report = self.quality.candles(records)
+
+        def write(session: Session, run_id: int) -> _WriterResult:
+            instruments = self._instruments(session)
+            inserted = skipped = 0
+            seen: set[tuple[str, str, datetime]] = set()
+            for record in records:
+                key = (record.symbol, record.interval.value, record.open_time)
+                if key in seen:
+                    skipped += 1
+                    continue
+                seen.add(key)
+                instrument = instruments.get(record.symbol)
+                if instrument is None:
+                    raise ValueError(f"Unknown {self.exchange} instrument: {record.symbol}")
+                existing = session.scalar(
+                    select(PriceCandle).where(
+                        PriceCandle.instrument_id == instrument.id,
+                        PriceCandle.interval == record.interval.value,
+                        PriceCandle.open_time == record.open_time,
+                    )
+                )
+                if existing is not None:
+                    if self._stored_candle_payload(existing) == self._record_candle_payload(record):
+                        skipped += 1
+                        continue
+                    conflict = QualityIssue(
+                        "conflicting_candle_revision",
+                        Severity.ERROR,
+                        f"{record.symbol} candle at {record.open_time.isoformat()} conflicts "
+                        "with the first curated observation",
+                        record.symbol,
+                    )
+                    raise DataQualityError(QualityReport(report.issues + (conflict,)))
+                session.add(
+                    PriceCandle(
+                        instrument_id=instrument.id,
+                        interval=record.interval.value,
+                        open_time=record.open_time,
+                        close_time=record.close_time,
+                        received_at=record.received_at,
+                        open_price=record.open_price,
+                        high_price=record.high_price,
+                        low_price=record.low_price,
+                        close_price=record.close_price,
+                        volume=record.volume,
+                        trade_count=record.trade_count,
+                        price_source=record.price_source,
+                        ingestion_run_id=run_id,
+                    )
+                )
+                inserted += 1
+            return inserted, 0, skipped
+
+        return self._execute("price_candles", report, write)
+
+    def record_failed_run(self, dataset: str, error: Exception | str) -> int:
+        """Record a collector-stage failure before normalized ingestion could begin."""
+
+        run_id = self._start_run(dataset)
+        self._finish_run(run_id, "failed", 0, str(error))
+        return run_id
+
     def _execute(
         self,
         dataset: str,
@@ -304,3 +376,34 @@ class IngestionService:
         instrument.listed_at = record.listed_at
         instrument.delisted_at = record.delisted_at
         instrument.metadata_json = dict(record.metadata)
+
+    @staticmethod
+    def _record_candle_payload(record: CandleRecord) -> tuple[object, ...]:
+        return (
+            record.close_time,
+            record.open_price,
+            record.high_price,
+            record.low_price,
+            record.close_price,
+            record.volume,
+            record.trade_count,
+            record.price_source,
+        )
+
+    @staticmethod
+    def _stored_candle_payload(record: PriceCandle) -> tuple[object, ...]:
+        close_time = (
+            record.close_time.replace(tzinfo=UTC)
+            if record.close_time.tzinfo is None
+            else record.close_time.astimezone(UTC)
+        )
+        return (
+            close_time,
+            record.open_price,
+            record.high_price,
+            record.low_price,
+            record.close_price,
+            record.volume,
+            record.trade_count,
+            record.price_source,
+        )

@@ -31,6 +31,10 @@ work/
 outputs/
 funding-study.json
 funding-study.md
+candles.csv
+coverage.json
+coverage.md
+manifest.json
 
 # Local databases.
 *.db

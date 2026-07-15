@@ -14,6 +14,20 @@ from uuid import uuid4
 from wartosc_perp_research.domain import ensure_utc
 
 
+class RawArchiveIntegrityError(RuntimeError):
+    """Raised when an existing archive envelope fails its content check."""
+
+
+def _payload_digest(request: dict[str, Any], response: Any) -> str:
+    canonical_payload = json.dumps(
+        {"request": request, "response": response},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical_payload).hexdigest()
+
+
 class RawResponseSink(Protocol):
     """Boundary used by collectors so archival is replaceable in tests or at scale."""
 
@@ -44,13 +58,7 @@ class RawArchive:
         received_at: datetime,
     ) -> Path:
         received_at = ensure_utc(received_at, "received_at")
-        canonical_payload = json.dumps(
-            {"request": request, "response": response},
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        digest = hashlib.sha256(canonical_payload).hexdigest()
+        digest = _payload_digest(request, response)
         envelope = {
             "schema_version": 1,
             "exchange": exchange,
@@ -63,8 +71,19 @@ class RawArchive:
         directory = self.root / exchange / dataset / received_at.strftime("%Y/%m/%d")
         directory.mkdir(parents=True, exist_ok=True)
         timestamp = received_at.strftime("%Y%m%dT%H%M%S.%fZ")
-        target = directory / f"{timestamp}_{digest[:16]}.json"
+        target = directory / f"{timestamp}_{digest}.json"
         if target.exists():
+            try:
+                existing = json.loads(target.read_text(encoding="utf-8"))
+                existing_digest = _payload_digest(existing["request"], existing["response"])
+            except (json.JSONDecodeError, KeyError, OSError, TypeError, ValueError) as exc:
+                raise RawArchiveIntegrityError(
+                    f"Existing raw archive envelope is unreadable or malformed: {target}"
+                ) from exc
+            if existing.get("payload_sha256") != digest or existing_digest != digest:
+                raise RawArchiveIntegrityError(
+                    f"Existing raw archive envelope does not match its payload digest: {target}"
+                )
             return target
 
         temporary = directory / f".{target.name}.{uuid4().hex}.tmp"

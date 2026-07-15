@@ -20,7 +20,10 @@ The package resource `wartosc_perp_research/resources/exchanges.yaml` contains v
 
 An exchange adapter owns transport details, pagination, retry/backoff, and vendor payload parsing. Its output is an exchange-neutral domain record. It must not write SQL, compute signals, or silently repair questionable source data. Its request boundary can accept a raw-response sink so a successful response is archived before parsing and persistence.
 
-Instrument discovery is mandatory. Funding history, market snapshots, and order books are optional capabilities because exchanges differ and incomplete adapters should fail explicitly. The interface is asynchronous to support network-bound collection without requiring a particular HTTP client in Phase 1.
+Instrument discovery is mandatory. Funding history, market snapshots, candle history, and order
+books are optional capabilities because exchanges differ and incomplete adapters should fail
+explicitly. The interface is asynchronous to support network-bound collection without requiring a
+particular HTTP client.
 
 ### Domain records
 
@@ -41,10 +44,18 @@ The Phase 1 schema includes:
 | `ingestion_runs` | Dataset lineage, cursor, record count, failure state |
 | `funding_rates` | Actual/predicted rates, interval, premium, associated mark/index prices |
 | `market_snapshots` | Mark, index, oracle, mid, prior-day price, funding, premium, open interest, 24h volume, clock source |
+| `price_candles` | Exchange candle interval, open/inclusive-close times, exact OHLCV, trade count, source identity |
 | `order_book_snapshots` | Snapshot timing, depth, sequence, checksum |
 | `order_book_levels` | Ordered bid/ask price and quantity levels |
 
-Composite uniqueness constraints provide an idempotency target for deterministic observations. The ingestion service also performs portable select-before-insert checks, so bounded batches work on SQLite and PostgreSQL without dialect-specific upserts. Database values use fixed precision. Foreign keys, checks, and lookup indexes protect basic research integrity.
+Composite uniqueness constraints provide an idempotency target for deterministic observations. The
+ingestion service also performs portable select-before-insert checks, so bounded batches work on
+SQLite and PostgreSQL without dialect-specific upserts. Candle decimals use exact text storage on
+SQLite because its `NUMERIC` affinity otherwise round-trips through binary float; other dialects use
+`NUMERIC(38, 18)`. The domain and storage boundary reject binary floats and any candle value that
+cannot be represented exactly with at most 20 integer and 18 fractional digits; prices are positive
+and volume is nonnegative. Domain validation remains the primary OHLC invariant gate. Foreign keys,
+checks, and lookup indexes protect basic research integrity.
 
 Raw payloads are independent of relational storage. Each successful response is wrapped with its request, UTC receipt time, dataset, schema version, and SHA-256 digest, then atomically written to a date-partitioned JSON path. This preserves replay and parser-audit capability without coupling collectors to a database.
 
@@ -61,10 +72,10 @@ Phase 1 deliberately leaves these unimplemented:
 - schema migrations and PostgreSQL deployment configuration;
 - scheduled gap and continuity checks across successive collection runs;
 - symbol/contract mapping across venues and a historical instrument universe;
-- trades, candles, liquidations, borrow rates, spot prices, and dated futures;
+- trades, liquidations, borrow rates, spot prices, and dated futures;
 - general query APIs beyond the bounded actual-funding repository;
 - fee, slippage, capacity, margin, and liquidation models;
-- reproducible dataset manifests and notebook execution;
+- generalized dataset manifests and notebook execution beyond the candle export;
 - monitoring, retries, scheduling, and data retention policies.
 
 ## Phased implementation roadmap
@@ -113,7 +124,45 @@ Exit criterion met for the single-venue MVP: identical windows over identical cu
 byte-identical reports with no forward-filled observations, ambiguous duplicates, or hidden
 generation timestamps. Cross-venue spread research remains deferred.
 
-### Phase 4 — Basis and microstructure
+### Phase 4A - Historical price-data foundation (implemented locally)
+
+The Hyperliquid adapter collects the public `candleSnapshot` response for all currently documented
+intervals and archives every response before normalization. `CandleRecord` preserves Decimal OHLCV,
+exchange open time, inclusive close time, base-unit volume, trade count, receipt time, and an
+explicit `hyperliquid_candle_ohlcv` source label. It deliberately does not rename candle prices as
+mark, index, oracle, mid, or executable prices.
+
+The official schema labels `t` as candle start and `T` as candle end; the official sample and
+interval arithmetic imply that `T` is inclusive, so eligibility begins at `T + 1ms`. The 14 native
+UTC grids are enforced, including Monday-aligned weeks and variable-length calendar months. The
+adapter excludes still-forming rows by default. Because request-boundary inclusion and response
+ordering are not explicit in the contract, it sends `end - 1ms` for a local start-inclusive,
+end-exclusive window, rejects out-of-chunk rows, deduplicates exact boundary rows, and sorts by `t`.
+
+General time-range guidance is handled with calendar-aware chunks of at most 500 expected slots.
+This request size is distinct from the latest-5,000-candle retention cap: collection is bounded to
+the final 5,000 requested slots and chunking cannot recover older venue data. Candle requests carry
+base rate-limit weight 20 plus additional weight per 60 returned elements. Raw envelopes use the
+`price_candles` dataset name and are preserved before parsing.
+
+The `price_candles` table is idempotent on instrument, interval, and open time. Quality checks cover
+source identity, completion at receipt, exact interval duration, duplicates, gaps, overlaps, OHLC
+invariants, volume, and trade count. Identical recollections are skipped; conflicting payloads fail
+the ingestion run without changing the first curated row, while both raw responses remain available
+for audit.
+
+Point-in-time repository queries default to strict `observed` mode: exchange availability at
+`T + 1ms`, receipt, and ingestion must all precede or equal the cutoff. The CLI deliberately selects
+`finalized_retrospective` for historical backfills. Every retrospective artifact labels that mode
+and warns that Hyperliquid exposes no revision history or proof of historical observability.
+
+The price export workflow produces a stable CSV, JSON coverage data, a Markdown coverage report,
+and a manifest containing hashes of their exact bytes. It has no generation timestamp, uses stable
+ordering, protects conflicting and unsafe output paths, does not impute missing bars, and reports
+the 5,000-candle retention limitation. This is a data checkpoint, not a return calculation or
+backtest; Phase 4B is not implemented here.
+
+### Phase 4B - Basis and microstructure
 
 Add spot and dated-futures references, trades, liquidations, and validated order-book ingestion. Research basis decomposition, depth, imbalance, spread, impact, latency, and capacity. Move high-frequency tables to partitioned PostgreSQL or columnar files only when measured volume justifies it.
 

@@ -5,14 +5,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 
 from wartosc_perp_research import cli
 from wartosc_perp_research.domain import (
+    CandleInterval,
+    CandleRecord,
     FundingRateRecord,
     InstrumentKind,
     InstrumentRecord,
     MarketSnapshotRecord,
+    candle_close_time,
 )
+from wartosc_perp_research.storage import Database, IngestionRun, PriceCandle
 
 
 def _config(tmp_path: Path) -> Path:
@@ -77,6 +82,23 @@ class FakeCollector:
             )
         ]
 
+    async def iter_candles(self, time_range: Any, interval: Any, symbols: Any) -> Any:
+        yield CandleRecord(
+            exchange=self.exchange,
+            symbol=symbols[0],
+            interval=CandleInterval(interval),
+            open_time=time_range.start,
+            close_time=candle_close_time(time_range.start, interval),
+            open_price=Decimal("100"),
+            high_price=Decimal("101"),
+            low_price=Decimal("99"),
+            close_price=Decimal("100.5"),
+            volume=Decimal("10"),
+            trade_count=5,
+            price_source="hyperliquid_candle_ohlcv",
+            received_at=time_range.end,
+        )
+
     async def close(self) -> None:
         return None
 
@@ -84,6 +106,20 @@ class FakeCollector:
 class FailingCollector(FakeCollector):
     async def fetch_instruments(self) -> list[InstrumentRecord]:
         raise RuntimeError("simulated collection failure")
+
+
+class EmptyCandleCollector(FakeCollector):
+    async def iter_candles(self, time_range: Any, interval: Any, symbols: Any) -> Any:
+        del time_range, interval, symbols
+        if False:  # pragma: no cover - marks this coroutine as an async generator
+            yield None
+
+
+class PartialFailingCandleCollector(FakeCollector):
+    async def iter_candles(self, time_range: Any, interval: Any, symbols: Any) -> Any:
+        async for record in super().iter_candles(time_range, interval, symbols):
+            yield record
+        raise RuntimeError("simulated partial candle collection failure")
 
 
 def test_db_init_creates_database_and_prints_json(tmp_path: Path, capsys: Any) -> None:
@@ -114,6 +150,21 @@ def test_db_init_creates_database_and_prints_json(tmp_path: Path, capsys: Any) -
             "funding_rates",
         ),
         (["hyperliquid", "snapshots", "--symbol", "BTC"], "market_snapshots"),
+        (
+            [
+                "hyperliquid",
+                "candles",
+                "--coin",
+                "BTC",
+                "--interval",
+                "1h",
+                "--start",
+                "2026-01-01T00:00:00Z",
+                "--end",
+                "2026-01-01T01:00:00Z",
+            ],
+            "price_candles",
+        ),
     ],
 )
 def test_hyperliquid_cli_paths(
@@ -314,6 +365,151 @@ def test_research_cli_rejects_file_as_output_directory(tmp_path: Path, capsys: A
 
     assert exit_code == 2
     assert "not a directory" in json.loads(capsys.readouterr().err)["error"]
+
+
+def test_research_price_cli_collects_and_writes_deterministic_exports(
+    tmp_path: Path,
+    capsys: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    output = tmp_path / "outputs" / "price-study"
+    monkeypatch.setattr(cli, "_collector", lambda _: FakeCollector())
+    arguments = [
+        "--config",
+        str(config),
+        "research",
+        "prices",
+        "--symbols",
+        "BTC",
+        "--interval",
+        "1h",
+        "--start",
+        "2026-01-01T00:00:00Z",
+        "--end",
+        "2026-01-01T01:00:00Z",
+        "--output",
+        str(output),
+    ]
+
+    assert cli.main([*arguments, "--collect"]) == 0
+    collected = json.loads(capsys.readouterr().out)
+    first = {path.name: path.read_bytes() for path in output.iterdir()}
+    assert collected["status"] == "complete"
+    assert collected["observation_counts"] == {"BTC": 1}
+    assert collected["missing_expected_observation_counts"] == {"BTC": 0}
+    assert set(first) == {"candles.csv", "coverage.json", "coverage.md", "manifest.json"}
+
+    assert cli.main(arguments) == 0
+    selected = json.loads(capsys.readouterr().out)
+    assert selected["dataset_source"] == "database"
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == first
+
+
+def test_research_price_cli_rejects_partial_interval_window(tmp_path: Path, capsys: Any) -> None:
+    config = _config(tmp_path)
+    exit_code = cli.main(
+        [
+            "--config",
+            str(config),
+            "research",
+            "prices",
+            "--symbols",
+            "BTC",
+            "--interval",
+            "1h",
+            "--start",
+            "2026-01-01T00:00:00Z",
+            "--end",
+            "2026-01-01T00:30:00Z",
+            "--output",
+            str(tmp_path / "partial"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "whole number" in json.loads(capsys.readouterr().err)["error"]
+    assert not (tmp_path / "research.db").exists()
+
+
+def test_price_collect_does_not_hide_empty_response_behind_complete_cache(
+    tmp_path: Path,
+    capsys: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    base = [
+        "--config",
+        str(config),
+        "research",
+        "prices",
+        "--symbols",
+        "BTC",
+        "--interval",
+        "1h",
+        "--start",
+        "2026-01-01T00:00:00Z",
+        "--end",
+        "2026-01-01T01:00:00Z",
+        "--output",
+    ]
+    monkeypatch.setattr(cli, "_collector", lambda _: FakeCollector())
+    assert cli.main([*base, str(tmp_path / "first"), "--collect"]) == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr(cli, "_collector", lambda _: EmptyCandleCollector())
+    assert cli.main([*base, str(tmp_path / "second"), "--collect"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "incomplete_data"
+    assert result["observation_counts"] == {"BTC": 1}
+    assert result["collection_coverage"]["observation_counts"] == {"BTC": 0}
+    assert result["collection_coverage"]["missing_expected_observation_counts"] == {"BTC": 1}
+
+
+def test_partial_price_collection_records_failure_without_curated_rows_or_export(
+    tmp_path: Path,
+    capsys: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    output = tmp_path / "partial-price-failure"
+    monkeypatch.setattr(cli, "_collector", lambda _: PartialFailingCandleCollector())
+
+    exit_code = cli.main(
+        [
+            "--config",
+            str(config),
+            "research",
+            "prices",
+            "--symbols",
+            "BTC",
+            "ETH",
+            "--interval",
+            "1h",
+            "--start",
+            "2026-01-01T00:00:00Z",
+            "--end",
+            "2026-01-01T01:00:00Z",
+            "--output",
+            str(output),
+            "--collect",
+        ]
+    )
+
+    assert exit_code == 1
+    assert "partial candle" in json.loads(capsys.readouterr().err)["error"]
+    assert not output.exists()
+    database = Database(f"sqlite:///{(tmp_path / 'research.db').as_posix()}")
+    try:
+        with database.session() as session:
+            failed_runs = session.scalars(
+                select(IngestionRun).where(IngestionRun.dataset == "price_candles")
+            ).all()
+            assert [(run.status, run.records_written) for run in failed_runs] == [("failed", 0)]
+            assert session.scalar(select(PriceCandle)) is None
+    finally:
+        database.dispose()
 
 
 def test_failed_collection_does_not_create_a_study(

@@ -24,6 +24,10 @@ The first Phase 2 vertical is now implemented for Hyperliquid's unauthenticated 
 Phase 3 adds the first research-facing workflow: deterministic completeness checks and
 descriptive funding-rate reports generated from actual Hyperliquid event timestamps.
 
+Phase 4A adds the historical price-data foundation: archived Hyperliquid candle responses,
+exact-decimal OHLCV storage, revision-aware idempotent ingestion, strict observed-time reads, and
+explicitly labeled retrospective exports with deterministic manifests and coverage reports.
+
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
 ## Architecture
@@ -69,6 +73,8 @@ src/wartosc_perp_research/
   research/funding.py                  pure funding statistics and completeness analysis
   research/funding_repository.py       event-time funding queries
   research/funding_report.py           deterministic JSON and Markdown reports
+  research/price_repository.py         point-in-time completed-candle queries
+  research/price_export.py             deterministic price exports and coverage manifests
   resources/exchanges.yaml             packaged non-secret defaults
   storage/database.py                  engine and transaction lifecycle
   storage/models.py                    relational schema
@@ -116,11 +122,80 @@ wpr hyperliquid instruments
 wpr hyperliquid funding --coin BTC --coin ETH \
   --start 2026-01-01T00:00:00Z --end 2026-01-08T00:00:00Z
 wpr hyperliquid snapshots --symbol BTC --symbol ETH
+wpr hyperliquid candles --coin BTC --coin ETH --interval 1h \
+  --start 2026-07-01T00:00:00Z --end 2026-07-08T00:00:00Z
 ```
 
 Funding event times come from Hyperliquid. `metaAndAssetCtxs` does not provide an exchange timestamp, so market snapshots use the local UTC receipt time and persist `event_time_source=received_at`. Funding uniqueness is `(instrument, event_time, is_predicted)`; snapshot uniqueness is `(instrument, event_time)`. Repeating a funding range therefore records a new ingestion run but skips already-curated observations.
 
 The CLI intentionally requires an explicit funding time range and coin list. This keeps exploratory pulls bounded and makes provenance obvious. Use `--config path/to/exchanges.yaml` before the command to select a custom database or data directory.
+
+## Historical candle data
+
+Phase 4A uses Hyperliquid's public `candleSnapshot` request. The current official contract accepts
+a coin, interval, start time, and end time in epoch milliseconds and returns `t`, `T`, `o`, `h`,
+`l`, `c`, `v`, and `n`. The official schema calls `t` the start time and `T` the end time; the
+official sample and interval arithmetic imply that `T` is the inclusive final millisecond. The
+adapter therefore makes a candle eligible at `T + 1ms`. OHLC, base-unit volume, and trade count
+retain the meanings supplied by the endpoint. See the official [info endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#candle-snapshot),
+[WebSocket candle schema](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions),
+and [rate limits](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits).
+
+All 14 native intervals are supported: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `8h`,
+`12h`, `1d`, `3d`, `1w`, and `1M`. Request boundaries must lie on each interval's native UTC grid;
+weekly candles are Monday-aligned and `1M` advances by calendar month rather than a fixed duration,
+including across short months and leap years.
+
+Hyperliquid's general time-range guidance recommends at most 500 returned elements. The adapter
+uses calendar-aware chunks of no more than 500 requested candle slots. This is separate from the
+endpoint's latest-5,000-candle retention cap: an oversized requested range is bounded to its final
+5,000 slots, and chunking never claims to recover data older than the venue still retains. A candle
+request consumes base weight 20 plus additional weight per 60 returned elements. The official docs
+do not make request-boundary inclusion or response ordering explicit, so the adapter implements a
+start-inclusive/end-exclusive contract by sending `endTime = end - 1ms`, rejects rows outside each
+chunk, removes exact boundary duplicates, and sorts accepted rows by exchange `t`.
+
+The stored price source is named `hyperliquid_candle_ohlcv`. It means only the OHLC values returned
+by `candleSnapshot`. It is not relabeled as a mark, index, oracle, mid, or executable price. Each
+successful request is archived under the `price_candles` raw dataset before parsing. Curated
+uniqueness is `(instrument, interval, open_time)`. An identical recollection is skipped, but a
+different close time, OHLCV value, trade count, or source for the same identity raises a deterministic
+conflicting-revision error. The first curated row remains unchanged and both source responses remain
+in the raw archive.
+
+SQLite candle decimals use an exact text-backed SQLAlchemy type to avoid SQLite's binary-float
+conversion; databases with native fixed precision use `NUMERIC(38, 18)`. Accepted values must be
+exactly representable at that precision: at most 20 integer digits and 18 fractional digits. Prices
+must be positive, volume nonnegative, and binary-float candle input is rejected. Quality gates also
+reject malformed native-grid timing, rows received before `T + 1ms`, impossible OHLC relationships,
+identity/source mismatches, inconsistent activity, overlaps, and conflicting revisions. Still-forming
+rows are excluded by default; gaps are reported and never filled.
+
+Create a deterministic research export from cached candles, or add `--collect` to collect first:
+
+```text
+wpr research prices \
+  --symbols BTC ETH \
+  --interval 1h \
+  --start 2026-07-01T00:00:00Z \
+  --end 2026-07-08T00:00:00Z \
+  --output outputs/price-study
+```
+
+The workflow writes `candles.csv`, `coverage.json`, `coverage.md`, and `manifest.json`. The manifest
+contains SHA-256 hashes of the exact CSV, JSON, and Markdown bytes and no generation clock, so
+identical analytical inputs are byte-identical. Stable ordering does not depend on database return
+order. Coverage uses the native UTC grid, compresses missing candles into ranges, and warns when a
+window exceeds the 5,000-candle retention cap. Existing different files require `--overwrite`;
+filesystem roots, symbolic-link path components, and non-regular target files are rejected.
+
+Repository reads are start-inclusive and end-exclusive. Their default `observed` knowledge mode is
+strict: a candle must have reached `T + 1ms` and both its receipt and ingestion timestamps must be at
+or before the cutoff. The research CLI explicitly uses `finalized_retrospective` mode so cached
+backfills can be exported; its JSON, Markdown, manifest, and CLI result label that mode and warn that
+Hyperliquid exposes neither revision history nor proof of when a backfilled candle first became
+observable. Retrospective output must not be mistaken for strict knowledge-time data. No
+interpolation, forward fill, partial candle, P&L, or Phase 4B functionality is included.
 
 ## Funding research workflow
 
@@ -185,6 +260,7 @@ GitHub Actions runs these checks against every currently supported Python versio
 - schedulers and always-on streaming services;
 - schema migrations while the pre-1.0 local schema is still being established;
 - a generic backtest engine before data semantics are validated;
+- price/funding P&L, return calculations, or strategy signals in Phase 4A;
 - premature distributed infrastructure.
 
 ## License

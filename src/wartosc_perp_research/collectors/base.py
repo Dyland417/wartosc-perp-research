@@ -13,6 +13,8 @@ from datetime import datetime
 from enum import StrEnum
 
 from wartosc_perp_research.domain import (
+    CandleInterval,
+    CandleRecord,
     FundingRateRecord,
     InstrumentRecord,
     MarketSnapshotRecord,
@@ -26,6 +28,7 @@ class DataCapability(StrEnum):
     FUNDING_HISTORY = "funding_history"
     MARKET_SNAPSHOT = "market_snapshot"
     ORDER_BOOK = "order_book"
+    CANDLES = "candles"
 
 
 class UnsupportedCapabilityError(NotImplementedError):
@@ -73,6 +76,15 @@ class ExchangeCollector(ABC):
     ) -> AsyncIterator[FundingRateRecord]:
         del time_range, symbols
         raise UnsupportedCapabilityError(f"{self.exchange} does not support funding history")
+
+    def iter_candles(
+        self,
+        time_range: TimeRange,
+        interval: CandleInterval,
+        symbols: Sequence[str],
+    ) -> AsyncIterator[CandleRecord]:
+        del time_range, interval, symbols
+        raise UnsupportedCapabilityError(f"{self.exchange} does not support candle history")
 
     async def fetch_market_snapshot(self, symbol: str) -> MarketSnapshotRecord:
         del symbol

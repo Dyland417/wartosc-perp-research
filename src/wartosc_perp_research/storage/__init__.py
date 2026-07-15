@@ -10,6 +10,7 @@ from .models import (
     MarketSnapshot,
     OrderBookLevel,
     OrderBookSnapshot,
+    PriceCandle,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "MarketSnapshot",
     "OrderBookLevel",
     "OrderBookSnapshot",
+    "PriceCandle",
 ]

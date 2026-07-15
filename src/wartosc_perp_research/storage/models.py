@@ -19,11 +19,64 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.sql.type_api import TypeEngine
+from sqlalchemy.types import TypeDecorator
+
+from wartosc_perp_research.domain.models import (
+    CANDLE_DECIMAL_PRECISION,
+    CANDLE_DECIMAL_SCALE,
+)
 
 
 def _decimal_column(*, nullable: bool = True) -> Mapped[Decimal | None]:
     return mapped_column(Numeric(38, 18), nullable=nullable)
+
+
+class ExactDecimal(TypeDecorator[Decimal]):
+    """Preserve Decimal exactly on SQLite and use native fixed precision elsewhere."""
+
+    impl = Numeric(38, 18)
+    cache_ok = True
+
+    def __init__(self, *, positive: bool = False) -> None:
+        super().__init__()
+        self.positive = positive
+
+    def load_dialect_impl(self, dialect: Dialect) -> TypeEngine[Any]:
+        if dialect.name == "sqlite":
+            return dialect.type_descriptor(String(80))
+        return dialect.type_descriptor(Numeric(38, 18))
+
+    def process_bind_param(self, value: Decimal | None, dialect: Dialect) -> Decimal | str | None:
+        if value is None:
+            return None
+        if isinstance(value, (bool, float)) or not isinstance(value, Decimal):
+            raise TypeError("ExactDecimal values must be Decimal instances")
+        decimal_value = value
+        if not decimal_value.is_finite():
+            raise ValueError("ExactDecimal values must be finite")
+        if decimal_value < 0 or (self.positive and decimal_value == 0):
+            qualifier = "positive" if self.positive else "nonnegative"
+            raise ValueError(f"ExactDecimal value must be {qualifier}")
+        _, decimal_digits, decimal_exponent = decimal_value.as_tuple()
+        significant_digits = list(decimal_digits)
+        while significant_digits and significant_digits[-1] == 0 and decimal_exponent < 0:
+            significant_digits.pop()
+            decimal_exponent += 1
+        fractional_digits = 0 if not decimal_value else max(-decimal_exponent, 0)
+        integer_digits = (
+            0 if not decimal_value else max(len(significant_digits) + decimal_exponent, 0)
+        )
+        if fractional_digits > CANDLE_DECIMAL_SCALE or integer_digits > (
+            CANDLE_DECIMAL_PRECISION - CANDLE_DECIMAL_SCALE
+        ):
+            raise ValueError("ExactDecimal value is not exactly representable as NUMERIC(38, 18)")
+        return format(decimal_value, "f") if dialect.name == "sqlite" else decimal_value
+
+    def process_result_value(self, value: Any, _: Dialect) -> Decimal | None:
+        return None if value is None else Decimal(str(value))
 
 
 class Base(DeclarativeBase):
@@ -79,6 +132,7 @@ class Instrument(Base):
 
     exchange: Mapped[Exchange] = relationship(back_populates="instruments")
     funding_rates: Mapped[list[FundingRate]] = relationship(back_populates="instrument")
+    price_candles: Mapped[list[PriceCandle]] = relationship(back_populates="instrument")
     market_snapshots: Mapped[list[MarketSnapshot]] = relationship(back_populates="instrument")
     order_book_snapshots: Mapped[list[OrderBookSnapshot]] = relationship(
         back_populates="instrument"
@@ -141,6 +195,50 @@ class FundingRate(Base):
     )
 
     instrument: Mapped[Instrument] = relationship(back_populates="funding_rates")
+
+
+class PriceCandle(Base):
+    """Exchange candle OHLCV; price semantics remain those of the source endpoint."""
+
+    __tablename__ = "price_candles"
+    __table_args__ = (
+        UniqueConstraint(
+            "instrument_id", "interval", "open_time", name="uq_price_candle_observation"
+        ),
+        Index("ix_price_candle_time", "open_time", "instrument_id", "interval"),
+        CheckConstraint("close_time > open_time", name="ck_price_candle_time_order"),
+        CheckConstraint("trade_count >= 0", name="ck_price_candle_trade_count_nonnegative"),
+        CheckConstraint(
+            "interval IN ('1m','3m','5m','15m','30m','1h','2h','4h','8h','12h',"
+            "'1d','3d','1w','1M')",
+            name="ck_price_candle_interval",
+        ),
+        CheckConstraint("length(price_source) > 0", name="ck_price_candle_source_nonempty"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    instrument_id: Mapped[int] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    interval: Mapped[str] = mapped_column(String(8), nullable=False)
+    open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    close_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    open_price: Mapped[Decimal] = mapped_column(ExactDecimal(positive=True), nullable=False)
+    high_price: Mapped[Decimal] = mapped_column(ExactDecimal(positive=True), nullable=False)
+    low_price: Mapped[Decimal] = mapped_column(ExactDecimal(positive=True), nullable=False)
+    close_price: Mapped[Decimal] = mapped_column(ExactDecimal(positive=True), nullable=False)
+    volume: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    trade_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    price_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    ingestion_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ingestion_runs.id", ondelete="SET NULL")
+    )
+
+    instrument: Mapped[Instrument] = relationship(back_populates="price_candles")
 
 
 class MarketSnapshot(Base):
