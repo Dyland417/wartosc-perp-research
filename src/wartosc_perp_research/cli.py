@@ -7,7 +7,8 @@ import asyncio
 import json
 import re
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -22,15 +23,23 @@ from wartosc_perp_research.collectors import TimeRange
 from wartosc_perp_research.collectors.hyperliquid import HyperliquidCollector
 from wartosc_perp_research.config import Settings, load_settings
 from wartosc_perp_research.domain import CandleInterval, CandleRecord
-from wartosc_perp_research.ingestion import IngestionResult, IngestionService
+from wartosc_perp_research.ingestion import (
+    IngestionResult,
+    IngestionService,
+    OracleArchiveIngestionService,
+)
+from wartosc_perp_research.oracle_archive import archive_spec, fetch_archive
 from wartosc_perp_research.research import (
     CandleKnowledgeMode,
     ReportOutputError,
     StoredCandle,
     analyze_funding_study,
     build_price_dataset,
+    funding_oracle_coverage_dict,
     load_actual_funding_observations,
     load_candles_point_in_time,
+    load_funding_oracle_dataset,
+    write_funding_oracle_report,
     write_funding_report,
     write_price_export,
 )
@@ -38,6 +47,7 @@ from wartosc_perp_research.storage import Database
 from wartosc_perp_research.storage.raw_archive import RawArchive
 
 _RESEARCH_SYMBOL = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_-]{0,127}\Z")
+_DURATION = re.compile(r"(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>ms|s|m|h)\Z")
 
 
 class ResearchRequestError(ValueError):
@@ -52,6 +62,32 @@ def _timestamp(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise argparse.ArgumentTypeError("Timestamps must include a timezone")
     return parsed.astimezone(UTC)
+
+
+def _archive_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Archive date must use YYYY-MM-DD") from exc
+
+
+def _duration(value: str) -> timedelta:
+    match = _DURATION.fullmatch(value)
+    if match is None:
+        raise argparse.ArgumentTypeError("Duration must be a positive value such as 10s or 500ms")
+    try:
+        amount = Decimal(match.group("value"))
+    except InvalidOperation as exc:  # pragma: no cover - protected by the expression
+        raise argparse.ArgumentTypeError("Duration must be decimal") from exc
+    factor = {"ms": Decimal("0.001"), "s": Decimal(1), "m": Decimal(60), "h": Decimal(3600)}[
+        match.group("unit")
+    ]
+    microseconds = amount * factor * Decimal(1_000_000)
+    if amount <= 0 or microseconds != microseconds.to_integral_value():
+        raise argparse.ArgumentTypeError(
+            "Duration must be positive and exactly representable in microseconds"
+        )
+    return timedelta(microseconds=int(microseconds))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +120,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     candles.add_argument("--start", type=_timestamp, required=True)
     candles.add_argument("--end", type=_timestamp, required=True)
+
+    oracle_archive = hyperliquid_commands.add_parser(
+        "oracle-archive", help="Acquire or ingest official retrospective oracle archives"
+    )
+    oracle_archive_commands = oracle_archive.add_subparsers(
+        dest="oracle_archive_command", required=True
+    )
+    oracle_fetch = oracle_archive_commands.add_parser(
+        "fetch", help="Preserve one official requester-pays archive object"
+    )
+    oracle_fetch.add_argument("--date", type=_archive_date, required=True)
+    oracle_fetch.add_argument("--output", type=Path, required=True)
+    oracle_fetch.add_argument("--request-payer", choices=["requester"], required=True)
+    oracle_fetch_modes = oracle_fetch.add_mutually_exclusive_group()
+    oracle_fetch_modes.add_argument(
+        "--dry-run", action="store_true", help="Show the exact object without AWS access"
+    )
+    oracle_fetch_modes.add_argument(
+        "--metadata-only", action="store_true", help="Request metadata but download no bytes"
+    )
+    oracle_ingest = oracle_archive_commands.add_parser(
+        "ingest", help="Normalize an already acquired local LZ4 CSV archive"
+    )
+    oracle_ingest.add_argument("--input", type=Path, required=True)
 
     research = commands.add_parser("research", help="Run reproducible research workflows")
     research_commands = research.add_subparsers(dest="research_command", required=True)
@@ -124,6 +184,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Replace existing export files when their contents differ",
+    )
+
+    funding_oracle = research_commands.add_parser(
+        "funding-oracle-align",
+        help="Align actual funding events to official retrospective oracle observations",
+    )
+    funding_oracle.add_argument("--symbols", nargs="+", required=True)
+    funding_oracle.add_argument("--start", type=_timestamp, required=True)
+    funding_oracle.add_argument("--end", type=_timestamp, required=True)
+    funding_oracle.add_argument(
+        "--max-oracle-age",
+        type=_duration,
+        required=True,
+        help="Required maximum age, e.g. 10s; no cadence is assumed",
+    )
+    funding_oracle.add_argument("--output", type=Path, required=True)
+    funding_oracle.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing alignment files when their contents differ",
     )
 
     backtest = commands.add_parser(
@@ -212,6 +292,93 @@ async def _run_hyperliquid(args: argparse.Namespace, settings: Settings) -> dict
     finally:
         await collector.close()
         database.dispose()
+
+
+def _run_oracle_archive(args: argparse.Namespace, settings: Settings) -> dict[str, Any]:
+    if args.oracle_archive_command == "fetch":
+        spec = archive_spec(args.date)
+        plan = {
+            "status": "planned",
+            "source_classification": "official_retrospective_archive",
+            "requester_pays": True,
+            "bucket": spec.bucket,
+            "object_key": spec.object_key,
+            "s3_uri": spec.s3_uri,
+            "download": not args.dry_run and not args.metadata_only,
+        }
+        print(json.dumps(plan, sort_keys=True))
+        result = fetch_archive(
+            spec,
+            args.output,
+            requester_pays_acknowledged=args.request_payer == "requester",
+            dry_run=args.dry_run,
+            metadata_only=args.metadata_only,
+        )
+        output: dict[str, Any] = {
+            "status": result.mode,
+            "source_classification": "official_retrospective_archive",
+            "bucket": spec.bucket,
+            "object_key": spec.object_key,
+            "s3_uri": spec.s3_uri,
+            "idempotent": result.idempotent,
+        }
+        if result.metadata is not None:
+            output["metadata"] = {
+                "etag": result.metadata.etag,
+                "object_size": result.metadata.object_size,
+                "last_modified": (
+                    result.metadata.last_modified.isoformat().replace("+00:00", "Z")
+                    if result.metadata.last_modified
+                    else None
+                ),
+            }
+        if result.local_path is not None:
+            output["local_path"] = str(result.local_path)
+            output["provenance_path"] = str(result.provenance_path)
+            output["sha256"] = result.provenance.sha256 if result.provenance else None
+            output["source_revision"] = (
+                result.provenance.is_revision if result.provenance else False
+            )
+        return output
+
+    database = Database(settings.database.url, echo=settings.database.echo)
+    database.create_schema()
+    try:
+        result = OracleArchiveIngestionService(database).ingest(args.input)
+    finally:
+        database.dispose()
+    incomplete = bool(
+        result.source_revision
+        or result.malformed_rows
+        or result.conflicting_observations
+        or any(issue.severity == "error" for issue in result.issues)
+    )
+    return {
+        "status": "incomplete_data" if incomplete else "complete",
+        "dataset": "historical_oracle_observations",
+        "source_classification": "official_retrospective_archive",
+        "run_id": result.run_id,
+        "archive_object_id": result.archive_object_id,
+        "archive_sha256": result.archive_sha256,
+        "source_revision": result.source_revision,
+        "valid_rows": result.valid_rows,
+        "malformed_rows": result.malformed_rows,
+        "observations_inserted": result.observations_inserted,
+        "source_links_inserted": result.source_links_inserted,
+        "exact_duplicates": result.exact_duplicates,
+        "conflicting_observations": result.conflicting_observations,
+        "rows_skipped": result.rows_skipped,
+        "quality_issues": [
+            {
+                "code": issue.code,
+                "severity": issue.severity,
+                "message": issue.message,
+                "symbol": issue.symbol,
+                "source_row_number": issue.source_row_number,
+            }
+            for issue in result.issues
+        ],
+    }
 
 
 async def _collect_research_funding(
@@ -461,6 +628,60 @@ def _stored_candle(record: CandleRecord) -> StoredCandle:
     )
 
 
+def _run_funding_oracle_research(args: argparse.Namespace, settings: Settings) -> dict[str, Any]:
+    symbols = sorted({symbol.strip() for symbol in args.symbols if symbol.strip()})
+    if not symbols:
+        raise ResearchRequestError("At least one symbol is required")
+    invalid_symbols = [symbol for symbol in symbols if not _RESEARCH_SYMBOL.fullmatch(symbol)]
+    if invalid_symbols:
+        raise ResearchRequestError("Invalid Hyperliquid symbol(s): " + ", ".join(invalid_symbols))
+    if args.end <= args.start:
+        raise ResearchRequestError("'end' must be after 'start'")
+
+    database = Database(settings.database.url, echo=settings.database.echo)
+    database.create_schema()
+    try:
+        dataset = load_funding_oracle_dataset(
+            database,
+            exchange="hyperliquid",
+            symbols=symbols,
+            start=args.start,
+            end=args.end,
+            max_oracle_age=args.max_oracle_age,
+        )
+        try:
+            paths = write_funding_oracle_report(dataset, args.output, overwrite=args.overwrite)
+        except ReportOutputError as exc:
+            raise ResearchRequestError(str(exc)) from exc
+    finally:
+        database.dispose()
+    coverage = funding_oracle_coverage_dict(dataset)
+    incomplete = any(
+        item.unaligned_events or item.requested_funding_events == 0 for item in dataset.coverage
+    )
+    incomplete = incomplete or bool(
+        dataset.malformed_archive_rows
+        or dataset.conflicting_observations
+        or dataset.source_revisions
+    )
+    return {
+        "status": "incomplete_data" if incomplete else "complete",
+        "study_type": "retrospective_funding_oracle_alignment",
+        "source_classification": "official_retrospective_archive",
+        "knowledge_mode": "retrospective_archive_availability",
+        "requested_funding_events": {
+            item.symbol: item.requested_funding_events for item in dataset.coverage
+        },
+        "aligned_events": {item.symbol: item.aligned_events for item in dataset.coverage},
+        "unaligned_events": {item.symbol: item.unaligned_events for item in dataset.coverage},
+        "data_quality": coverage["data_quality"],
+        "aligned_observations_csv": str(paths.aligned_csv),
+        "coverage_json": str(paths.coverage_json),
+        "coverage_markdown": str(paths.coverage_markdown),
+        "manifest_json": str(paths.manifest_json),
+    }
+
+
 def _run_backtest_scenario(args: argparse.Namespace) -> dict[str, Any]:
     try:
         scenario = load_backtest_scenario(args.input)
@@ -500,11 +721,16 @@ def main(argv: list[str] | None = None) -> int:
                     database.dispose()
                 output = {"status": "ok", "database": settings.database.url}
             elif args.command == "hyperliquid":
-                output = asyncio.run(_run_hyperliquid(args, settings))
+                if args.hl_command == "oracle-archive":
+                    output = _run_oracle_archive(args, settings)
+                else:
+                    output = asyncio.run(_run_hyperliquid(args, settings))
             elif args.research_command == "funding":
                 output = _run_funding_research(args, settings)
-            else:
+            elif args.research_command == "prices":
                 output = _run_price_research(args, settings)
+            else:
+                output = _run_funding_oracle_research(args, settings)
     except ResearchRequestError as exc:
         print(json.dumps({"status": "invalid_request", "error": str(exc)}), file=sys.stderr)
         return 2

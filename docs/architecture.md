@@ -196,6 +196,59 @@ Exit criterion for this checkpoint: hand-calculated long, short, reduction, flip
 negative funding, and same-timestamp fixtures reconcile exactly and identical inputs produce
 byte-identical reports.
 
+### Phase 4B - Official oracle archive and funding alignment (checkpoint 2)
+
+Acquisition and ingestion are separate boundaries. Acquisition names exactly one official
+requester-pays `hyperliquid-archive/asset_ctxs/YYYYMMDD.csv.lz4` object, requires an explicit payer
+acknowledgement, and supports request-free dry runs and metadata-only inspection. Optional `boto3`
+and `lz4` dependencies keep the core research install small. The compressed object is immutable;
+content hashes make repeated bytes idempotent and preserve changed bytes under the same key as a
+source revision. Credentials remain in the AWS SDK's external credential chain.
+
+The strict `hyperliquid_asset_ctx_v1` parser is grounded in Hyperliquid's official historical
+importer because the public historical-data page does not publish CSV columns. Required fields are
+`time`, `coin`, and `oracle_px`; only the known context fields are optional. The parser streams LZ4,
+requires an explicit UTC exchange timestamp, converts the authoritative oracle string directly to
+Decimal, retains raw row values and hashes, quarantines malformed data, and rejects unknown schema.
+No mark, mid, index, candle, or context price can substitute for `oracle_px`.
+UTF-8 and standard CSV quoting are used. Source symbols are preserved without case normalization,
+and event times retain exact microseconds; finer timestamp precision is quarantined rather than
+silently rounded until a live archive can establish a different storage requirement. ETag remains
+source metadata, while SHA-256 over the original compressed object is the content identity.
+
+The downloader requires S3 `ContentLength`, enforces a 2 GiB compressed-byte ceiling during the
+transfer, and atomically promotes only a size-verified object. The parser separately caps the
+decompressed stream at 8 GiB and 20 million rows. These defaults are explicit
+`OracleArchiveLimits`, not claims about the current size of a live archive object. The schema is
+grounded in the official importer/tables but remains unvalidated against a paid live object.
+
+Four relational tables preserve immutable archive objects, deduplicated oracle observations,
+source-row links, and malformed-row quarantine. Exact duplicates share an observation and retain
+all source rows. Distinct values at one exchange/symbol/event-time identity are preserved and every
+candidate is marked conflicting. Revisions point to the first stored object version; none of these
+conditions silently overwrite curated data.
+
+The pure alignment layer selects the latest oracle event time at or before each actual funding
+settlement. It requires a positive maximum age, never consults receipt or ingestion time as market
+time, permits the exact tolerance boundary, and retains stale, missing, and conflicting funding
+rows as unaligned. A conflict at the latest eligible timestamp cannot fall back to an older value.
+Predicted funding and future oracle rows are excluded. The staleness tolerance has no default: the
+documented roughly three-second validator update cadence is not evidence of every archive row's
+sampling cadence.
+
+The research layer emits a stable all-events CSV, coverage JSON, human-readable Markdown, and a
+hash manifest. Per-symbol coverage includes aligned/unaligned counts, missing archive periods, age
+percentiles, conflict/revision/malformed evidence, and source-object provenance. Analytical files
+contain no generation timestamp or machine path. The retrieval timestamp remains only in raw source
+provenance because it is evidence about acquisition rather than an analytical clock. Each exported
+alignment retains both the funding-event database identity and every normalized oracle-observation
+identity selected at the eligible timestamp, plus immutable archive/row provenance.
+
+Exit criterion: synthetic exact/prior/stale/missing/conflict fixtures align without look-ahead;
+archive bytes and revisions remain auditable; malformed data cannot enter aligned results; repeated
+analytical inputs produce byte-identical artifacts. A real requester-pays sample remains a release
+review item when credentials, network access, and explicit transfer authorization are available.
+
 ### Phase 4C - Basis and microstructure
 
 Add spot and dated-futures references, trades, liquidations, and validated order-book ingestion. Research basis decomposition, depth, imbalance, spread, impact, latency, and capacity. Move high-frequency tables to partitioned PostgreSQL or columnar files only when measured volume justifies it.

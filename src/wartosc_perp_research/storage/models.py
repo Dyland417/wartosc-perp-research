@@ -16,6 +16,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -97,6 +98,12 @@ class Exchange(Base):
 
     instruments: Mapped[list[Instrument]] = relationship(back_populates="exchange")
     ingestion_runs: Mapped[list[IngestionRun]] = relationship(back_populates="exchange")
+    oracle_archive_objects: Mapped[list[OracleArchiveObject]] = relationship(
+        back_populates="exchange"
+    )
+    historical_oracle_observations: Mapped[list[HistoricalOracleObservation]] = relationship(
+        back_populates="exchange"
+    )
 
 
 class Instrument(Base):
@@ -195,6 +202,137 @@ class FundingRate(Base):
     )
 
     instrument: Mapped[Instrument] = relationship(back_populates="funding_rates")
+
+
+class OracleArchiveObject(Base):
+    """Immutable official archive content; one object key may have multiple revisions."""
+
+    __tablename__ = "oracle_archive_objects"
+    __table_args__ = (
+        UniqueConstraint(
+            "exchange_id",
+            "bucket",
+            "object_key",
+            "sha256",
+            name="uq_oracle_archive_content",
+        ),
+        Index("ix_oracle_archive_object", "exchange_id", "bucket", "object_key"),
+        CheckConstraint("object_size >= 0", name="ck_oracle_archive_size_nonnegative"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    exchange_id: Mapped[int] = mapped_column(
+        ForeignKey("exchanges.id", ondelete="RESTRICT"), nullable=False
+    )
+    bucket: Mapped[str] = mapped_column(String(255), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    etag: Mapped[str | None] = mapped_column(String(255))
+    object_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_modified: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retrieved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    compression: Mapped[str] = mapped_column(String(32), nullable=False)
+    parser_schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_classification: Mapped[str] = mapped_column(String(128), nullable=False)
+    is_revision: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    revision_of_id: Mapped[int | None] = mapped_column(
+        ForeignKey("oracle_archive_objects.id", ondelete="RESTRICT")
+    )
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    exchange: Mapped[Exchange] = relationship(back_populates="oracle_archive_objects")
+    observation_sources: Mapped[list[OracleObservationSource]] = relationship(
+        back_populates="archive_object", cascade="all, delete-orphan"
+    )
+    malformed_rows: Mapped[list[OracleMalformedRow]] = relationship(
+        back_populates="archive_object", cascade="all, delete-orphan"
+    )
+
+
+class HistoricalOracleObservation(Base):
+    """Deduplicated oracle value keyed by market event identity and exact price."""
+
+    __tablename__ = "historical_oracle_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "exchange_id",
+            "symbol",
+            "event_time",
+            "oracle_price",
+            name="uq_historical_oracle_value",
+        ),
+        Index("ix_historical_oracle_time", "exchange_id", "symbol", "event_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    exchange_id: Mapped[int] = mapped_column(
+        ForeignKey("exchanges.id", ondelete="RESTRICT"), nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(128), nullable=False)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    oracle_price: Mapped[Decimal] = mapped_column(ExactDecimal(positive=True), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    is_conflicting: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    first_ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    exchange: Mapped[Exchange] = relationship(back_populates="historical_oracle_observations")
+    sources: Mapped[list[OracleObservationSource]] = relationship(
+        back_populates="observation", cascade="all, delete-orphan"
+    )
+
+
+class OracleObservationSource(Base):
+    """Row-level provenance linking an observation to every archive that supplied it."""
+
+    __tablename__ = "oracle_observation_sources"
+    __table_args__ = (
+        UniqueConstraint(
+            "archive_object_id", "source_row_number", name="uq_oracle_archive_source_row"
+        ),
+        Index("ix_oracle_source_observation", "observation_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    observation_id: Mapped[int] = mapped_column(
+        ForeignKey("historical_oracle_observations.id", ondelete="CASCADE"), nullable=False
+    )
+    archive_object_id: Mapped[int] = mapped_column(
+        ForeignKey("oracle_archive_objects.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_row_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_row_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_values: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
+
+    observation: Mapped[HistoricalOracleObservation] = relationship(back_populates="sources")
+    archive_object: Mapped[OracleArchiveObject] = relationship(back_populates="observation_sources")
+
+
+class OracleMalformedRow(Base):
+    """Quarantined archive row that was never eligible for normalized research use."""
+
+    __tablename__ = "oracle_malformed_rows"
+    __table_args__ = (
+        UniqueConstraint(
+            "archive_object_id", "source_row_number", name="uq_oracle_malformed_source_row"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    archive_object_id: Mapped[int] = mapped_column(
+        ForeignKey("oracle_archive_objects.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    source_row_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_row_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    error_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_values: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+    archive_object: Mapped[OracleArchiveObject] = relationship(back_populates="malformed_rows")
 
 
 class PriceCandle(Base):

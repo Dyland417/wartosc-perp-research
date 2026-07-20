@@ -306,6 +306,108 @@ byte-stable. This first checkpoint assumes full fills and does not model signals
 liquidation, partial fills, latency, capacity, market impact, or execution uncertainty. These are
 scenario-supplied accounting simulations, not automatically generated historical backtests.
 
+## Official historical oracle archive and funding alignment
+
+Phase 4B checkpoint 2 adds an offline-first path from Hyperliquid's official retrospective
+`asset_ctxs` archive to a deterministic funding/oracle research dataset. Hyperliquid documents the
+requester-pays bucket as `hyperliquid-archive`, the object pattern as
+`asset_ctxs/YYYYMMDD.csv.lz4`, LZ4 compression, approximately monthly uploads, and no guarantee of
+timely or complete data. Downloaded objects are source evidence, not proof that the same data was
+available live at the event time.
+
+The public historical-data page does not publish the CSV header. The version-1 parser is therefore
+based on Hyperliquid's official historical `hyperliquid-stats` importer, which identifies `time`,
+`coin`, and `oracle_px` and the known optional context fields. It rejects an unknown header rather
+than guessing. `time` is treated as the exchange event timestamp and must explicitly use UTC;
+`oracle_px` is the authoritative oracle field and is parsed directly to `Decimal`. Mark, mid,
+index, candle, and generic context prices are never substituted. A paid live sample was not used to
+derive or loosen this schema.
+
+The parser uses UTF-8 and standard CSV quoting, preserves the source symbol exactly (no implicit
+case remapping), and accepts explicit UTC ISO-8601 timestamps through exact microsecond resolution.
+Finer timestamp precision is quarantined rather than silently rounded. This policy must be revisited
+if a live archive proves the source contains finer event time.
+
+Install the optional acquisition/decompression dependencies only when needed:
+
+```text
+pip install "wartosc-perp-research[oracle-archive]"
+```
+
+Plan a single object without AWS access or transfer charges:
+
+```text
+wpr hyperliquid oracle-archive fetch \
+  --date 2026-01-01 \
+  --output work/oracle-archive \
+  --request-payer requester \
+  --dry-run
+```
+
+Remove `--dry-run` only after intentionally authorizing requester-pays transfer. `--metadata-only`
+performs a requester-pays HEAD request but downloads no bytes. The CLI prints the exact S3 bucket,
+key, and URI before any request. It never reads credentials into project configuration or writes
+them to logs or artifacts; the AWS SDK uses its normal external credential chain. Acquisition is
+bounded to one date/object per invocation.
+
+An acquired compressed object is never mutated. The sidecar records its bucket/key, ETag, byte
+size, last-modified and retrieval timestamps, SHA-256, compression, parser version, and source
+classification. Identical bytes are idempotent. New bytes under the same official key are retained
+as a content-addressed revision while the original remains unchanged. Downloaded `*.csv.lz4`
+objects and their provenance sidecars are ignored by Git.
+ETag is retained only as source metadata; SHA-256 over the original compressed bytes is the content
+identity.
+
+Acquisition refuses a body download when S3 omits `ContentLength`, caps each compressed object at
+2 GiB, and enforces the same ceiling while bytes are written so incorrect metadata cannot permit an
+unbounded partial file. Offline parsing streams the LZ4 frame with default ceilings of 8 GiB of
+decompressed CSV and 20 million data rows. These conservative library-level limits fail closed;
+they can be changed only by explicitly supplying an `OracleArchiveLimits` policy in Python after
+reviewing the expected object size.
+
+Ingestion is deliberately separate and works offline:
+
+```text
+wpr hyperliquid oracle-archive ingest \
+  --input work/oracle-archive/hyperliquid-archive/asset_ctxs/20260101.csv.lz4
+```
+
+The streaming parser quarantines malformed rows, rejects schema drift, retains original row values
+and row hashes, and reports duplicates, source revisions, ordering, gaps, partial coverage, future
+timestamps, and large price jumps. Large jumps are warnings, not automatic deletions. Exact
+duplicate values share one normalized observation but retain every source row. Distinct prices at
+one symbol/timestamp are retained and flagged as conflicting; research selection excludes the
+entire conflicting timestamp rather than picking a value.
+
+Align cached actual funding events after archive ingestion:
+
+```text
+wpr research funding-oracle-align \
+  --symbols BTC ETH \
+  --start 2026-01-01T00:00:00Z \
+  --end 2026-01-02T00:00:00Z \
+  --max-oracle-age 10s \
+  --output outputs/funding-oracle-study
+```
+
+The join uses only the latest oracle exchange timestamp less than or equal to each funding event.
+The maximum age is required: documentation says validators normally update the oracle about every
+three seconds, but no default is claimed without a validated sample of the archive's actual cadence.
+Equality with the tolerance is accepted; older, missing, or conflicting candidates remain explicit
+unaligned rows. Predicted funding is excluded, receipt/ingestion times are never used as market
+time, and no values are interpolated or imputed.
+
+Outputs are `aligned-observations.csv`, `coverage.json`, `coverage.md`, and `manifest.json`.
+Coverage separates requested, aligned, stale, missing, and conflicting events; reports missing
+archive periods, exact oracle-age percentiles, per-symbol coverage, and archive provenance. Stable
+ordering, exact Decimal serialization, no generation clock, and exact-byte hashes make identical
+analytical inputs byte-identical. A valid but incomplete study exits `0` with prominent warnings;
+invalid requests or unsafe output paths exit `2`; dependency, access, integrity, configuration, or
+database failures exit `1`. This is a retrospective aligned dataset, not a strategy backtest.
+Funding and normalized oracle database identifiers are included on every applicable CSV row;
+retrieval timestamps remain in raw/relational provenance but are intentionally excluded from
+analytical artifacts and their hashes.
+
 ## Funding research workflow
 
 Analyze actual funding already stored in the configured database:
@@ -370,7 +472,7 @@ GitHub Actions runs these checks against every currently supported Python versio
 - schema migrations while the pre-1.0 local schema is still being established;
 - automatic strategy generation or candle-to-fill inference;
 - margin, liquidation, cross-collateral, partial-fill, latency, and capacity models;
-- automatic alignment of cached candles and funding until historical oracle prices are available;
+- automatic strategy-event generation from aligned funding and oracle data;
 - premature distributed infrastructure.
 
 ## License

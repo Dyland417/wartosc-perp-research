@@ -280,6 +280,69 @@ class FundingRateRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoricalOracleObservationRecord:
+    """One exact oracle observation from an immutable retrospective archive row."""
+
+    exchange: str
+    symbol: str
+    event_time: datetime
+    oracle_price: Decimal
+    source_type: str
+    archive_bucket: str
+    archive_object_key: str
+    archive_sha256: str
+    source_row_number: int
+    source_row_sha256: str
+    schema_version: str
+    raw_values: Mapping[str, str] = field(default_factory=dict)
+    retrieved_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "exchange", _text(self.exchange, "exchange", lower=True))
+        object.__setattr__(self, "symbol", _text(self.symbol, "symbol"))
+        if self.event_time.tzinfo is None or self.event_time.utcoffset() is None:
+            raise ValueError("'event_time' must be timezone-aware")
+        if self.event_time.utcoffset() != timedelta(0):
+            raise ValueError("'event_time' must use UTC rather than a non-UTC offset")
+        object.__setattr__(self, "event_time", self.event_time.astimezone(UTC))
+        object.__setattr__(
+            self,
+            "oracle_price",
+            _candle_decimal(self.oracle_price, "oracle_price", positive=True),
+        )
+        for field_name in (
+            "source_type",
+            "archive_bucket",
+            "archive_object_key",
+            "schema_version",
+        ):
+            object.__setattr__(self, field_name, _text(getattr(self, field_name), field_name))
+        for field_name in ("archive_sha256", "source_row_sha256"):
+            value = _text(getattr(self, field_name), field_name, lower=True)
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"'{field_name}' must be a lowercase SHA-256 digest")
+            object.__setattr__(self, field_name, value)
+        if (
+            isinstance(self.source_row_number, bool)
+            or not isinstance(self.source_row_number, int)
+            or self.source_row_number < 2
+        ):
+            raise ValueError("'source_row_number' must identify a CSV data row")
+        object.__setattr__(
+            self,
+            "retrieved_at",
+            ensure_utc(self.retrieved_at, "retrieved_at") if self.retrieved_at else None,
+        )
+        raw_values = dict(self.raw_values)
+        if any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in raw_values.items()
+        ):
+            raise TypeError("'raw_values' must contain only string keys and values")
+        object.__setattr__(self, "raw_values", MappingProxyType(raw_values))
+
+
+@dataclass(frozen=True, slots=True)
 class CandleRecord:
     """One completed exchange-provided OHLCV candle.
 

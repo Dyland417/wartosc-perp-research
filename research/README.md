@@ -59,3 +59,25 @@ for multiple same-type events at one timestamp. Cash and equity identities are c
 event. Execution-price slippage is already economic P&L; reference-price slippage is attribution
 only. Oracle provenance remains scenario-supplied, so these deterministic artifacts are accounting
 simulations rather than automatically generated historical backtests.
+
+Checkpoint 2 can replace scenario-asserted oracle provenance with an official retrospective source
+dataset. Acquisition is a separate requester-pays operation; offline ingestion and alignment are:
+
+```text
+wpr hyperliquid oracle-archive ingest \
+  --input work/oracle-archive/hyperliquid-archive/asset_ctxs/20260101.csv.lz4
+
+wpr research funding-oracle-align --symbols BTC ETH \
+  --start 2026-01-01T00:00:00Z --end 2026-01-02T00:00:00Z \
+  --max-oracle-age 10s --output outputs/funding-oracle-study
+```
+
+Alignment uses the latest non-conflicting oracle exchange timestamp at or before settlement and
+requires an explicit maximum age. Stale, absent, and conflicting candidates remain unaligned rows;
+future values, predicted funding, imputation, and candle substitution are prohibited. The CSV,
+coverage JSON/Markdown, and manifest are deterministic and identify retrospective source
+limitations, missing archive periods, exact oracle age, and row/object provenance. These outputs
+include funding-event and normalized oracle-observation identities. Retrieval timestamps remain
+source provenance and are excluded from analytical hashes. These outputs are aligned research
+datasets, not strategy backtests. The strict parser follows Hyperliquid's official importer/schema
+but has not yet been checked against a paid live archive object.

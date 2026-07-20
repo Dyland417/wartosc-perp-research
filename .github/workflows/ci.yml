@@ -28,7 +28,10 @@ jobs:
       - name: Install package and developer tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[dev]"
+          python -m pip install ".[dev,oracle-archive]"
+
+      - name: Verify archive dependencies are active
+        run: python -c "import boto3, lz4.frame"
 
       - name: Lint
         if: matrix.python-version == '3.11'
@@ -38,6 +41,101 @@ jobs:
         if: matrix.python-version == '3.11'
         run: ruff format --check .
 
+      - name: Exercise real LZ4 frame
+        run: >-
+          pytest -q
+          tests/test_oracle_archive.py::test_real_lz4_frame_round_trip_when_optional_dependency_is_installed
+
       - name: Test
         run: pytest --cov=wartosc_perp_research --cov-report=term-missing --cov-report=xml
 
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Verify core-only wheel installation
+        run: |
+          WHEEL=$(find dist -name '*.whl' -print -quit)
+          python -m venv work/core-venv
+          work/core-venv/bin/python -m pip install "$WHEEL"
+          work/core-venv/bin/python -m pip check
+          work/core-venv/bin/python - <<'PY'
+          import importlib.util
+          from wartosc_perp_research.cli import main
+          from wartosc_perp_research.config import load_settings
+          from wartosc_perp_research.oracle_archive import (
+              OracleArchiveDependencyError,
+              _default_s3_client,
+              _require_lz4,
+          )
+
+          settings = load_settings()
+          assert settings.exchanges["hyperliquid"].options["api_url"].startswith(
+              "https://"
+          )
+          assert main(
+              [
+                  "hyperliquid",
+                  "oracle-archive",
+                  "fetch",
+                  "--date",
+                  "2026-01-01",
+                  "--output",
+                  "work/archive",
+                  "--request-payer",
+                  "requester",
+                  "--dry-run",
+              ]
+          ) == 0
+          assert importlib.util.find_spec("boto3") is None
+          assert importlib.util.find_spec("lz4") is None
+          for capability in (_default_s3_client, _require_lz4):
+              try:
+                  capability()
+              except OracleArchiveDependencyError as exc:
+                  assert "oracle-archive" in str(exc)
+              else:
+                  raise AssertionError("missing optional dependency was not actionable")
+          PY
+
+      - name: Verify archive-enabled wheel installation and real LZ4 parsing
+        run: |
+          WHEEL=$(find dist -name '*.whl' -print -quit)
+          python -m venv work/archive-venv
+          work/archive-venv/bin/python -m pip install "${WHEEL}[oracle-archive]"
+          work/archive-venv/bin/python -m pip check
+          work/archive-venv/bin/python - <<'PY'
+          from decimal import Decimal
+          from pathlib import Path
+
+          import boto3
+          import lz4.frame
+
+          from wartosc_perp_research.oracle_archive import parse_oracle_archive
+
+          path = Path("work/20260101.csv.lz4")
+          with lz4.frame.open(path, mode="wb") as destination:
+              destination.write(
+                  b"time,coin,oracle_px\n"
+                  b"2026-01-01T00:00:00.000001Z,BTC,100.000000000000000001\n"
+              )
+          parsed = parse_oracle_archive(path)
+          assert parsed.observations[0].oracle_price == Decimal(
+              "100.000000000000000001"
+          )
+          assert parsed.observations[0].event_time.microsecond == 1
+          PY
