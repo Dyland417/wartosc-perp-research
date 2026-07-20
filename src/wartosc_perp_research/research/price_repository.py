@@ -11,7 +11,7 @@ from enum import StrEnum
 from sqlalchemy import select
 
 from wartosc_perp_research.domain import CandleInterval, CandleRecord, ensure_utc
-from wartosc_perp_research.storage import Database, Exchange, Instrument, PriceCandle
+from wartosc_perp_research.storage import Database, Exchange, IngestionRun, Instrument, PriceCandle
 
 
 def _database_utc(value: datetime) -> datetime:
@@ -42,6 +42,11 @@ class StoredCandle:
     price_source: str
     received_at: datetime
     ingested_at: datetime
+    candle_id: int | None = None
+    ingestion_run_id: int | None = None
+    ingestion_run_status: str | None = None
+    ingestion_run_dataset: str | None = None
+    ingestion_run_collector: str | None = None
 
     def __post_init__(self) -> None:
         validated = CandleRecord(
@@ -75,6 +80,10 @@ class StoredCandle:
         ):
             object.__setattr__(self, field_name, getattr(validated, field_name))
         object.__setattr__(self, "ingested_at", ensure_utc(self.ingested_at, "ingested_at"))
+        for field_name in ("candle_id", "ingestion_run_id"):
+            value = getattr(self, field_name)
+            if value is not None and (isinstance(value, bool) or value <= 0):
+                raise ValueError(f"'{field_name}' must be a positive integer or None")
 
 
 def load_candles_point_in_time(
@@ -121,6 +130,7 @@ def load_candles_point_in_time(
         filters.extend([PriceCandle.received_at <= as_of, PriceCandle.ingested_at <= as_of])
     statement = (
         select(
+            PriceCandle.id.label("candle_id"),
             Instrument.symbol,
             PriceCandle.interval,
             PriceCandle.open_time,
@@ -134,9 +144,14 @@ def load_candles_point_in_time(
             PriceCandle.price_source,
             PriceCandle.received_at,
             PriceCandle.ingested_at,
+            PriceCandle.ingestion_run_id,
+            IngestionRun.status.label("ingestion_run_status"),
+            IngestionRun.dataset.label("ingestion_run_dataset"),
+            IngestionRun.collector.label("ingestion_run_collector"),
         )
         .join(PriceCandle, PriceCandle.instrument_id == Instrument.id)
         .join(Exchange, Exchange.id == Instrument.exchange_id)
+        .outerjoin(IngestionRun, IngestionRun.id == PriceCandle.ingestion_run_id)
         .where(*filters)
         .order_by(Instrument.symbol, PriceCandle.open_time)
     )
@@ -157,6 +172,11 @@ def load_candles_point_in_time(
             price_source=row.price_source,
             received_at=_database_utc(row.received_at),
             ingested_at=_database_utc(row.ingested_at),
+            candle_id=row.candle_id,
+            ingestion_run_id=row.ingestion_run_id,
+            ingestion_run_status=row.ingestion_run_status,
+            ingestion_run_dataset=row.ingestion_run_dataset,
+            ingestion_run_collector=row.ingestion_run_collector,
         )
         for row in rows
     ]

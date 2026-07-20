@@ -14,6 +14,7 @@ from wartosc_perp_research.storage import (
     Exchange,
     FundingRate,
     HistoricalOracleObservation,
+    IngestionRun,
     Instrument,
     OracleArchiveObject,
     OracleMalformedRow,
@@ -68,9 +69,13 @@ def load_funding_oracle_dataset(
                 FundingRate.received_at,
                 FundingRate.ingested_at,
                 FundingRate.ingestion_run_id,
+                IngestionRun.status.label("ingestion_run_status"),
+                IngestionRun.dataset.label("ingestion_run_dataset"),
+                IngestionRun.collector.label("ingestion_run_collector"),
             )
             .join(Instrument, FundingRate.instrument_id == Instrument.id)
             .join(Exchange, Instrument.exchange_id == Exchange.id)
+            .outerjoin(IngestionRun, IngestionRun.id == FundingRate.ingestion_run_id)
             .where(
                 Exchange.name == exchange,
                 Instrument.symbol.in_(normalized_symbols),
@@ -179,6 +184,9 @@ def load_funding_oracle_dataset(
             received_at=_database_utc(row.received_at),
             ingested_at=_database_utc(row.ingested_at),
             ingestion_run_id=row.ingestion_run_id,
+            ingestion_run_status=row.ingestion_run_status,
+            ingestion_run_dataset=row.ingestion_run_dataset,
+            ingestion_run_collector=row.ingestion_run_collector,
         )
         for row in funding_rows
     ]

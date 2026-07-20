@@ -249,6 +249,53 @@ archive bytes and revisions remain auditable; malformed data cannot enter aligne
 analytical inputs produce byte-identical artifacts. A real requester-pays sample remains a release
 review item when credentials, network access, and explicit transfer authorization are available.
 
+### Phase 4B - Deterministic database-to-scenario adapter (checkpoint 3)
+
+The adapter is a compiler, not a strategy. It combines one strict, versioned target-position
+schedule with one explicit execution-assumption set and curated Hyperliquid candles, actual hourly
+funding, and validated official oracle alignments. The output is a schema-v2 scenario that the
+checkpoint-1 accounting CLI accepts unchanged. The adapter creates events but never duplicates the
+accounting engine's position or P&L calculations.
+
+Schedules contain stable intent IDs, one venue/instrument, UTC decision times on a declared
+decision grid, exact signed target quantities, and optional non-computational notes. They contain no
+prices or signals. The adapter cannot prove that an external schedule was generated without
+look-ahead; that requires separate point-in-time generation provenance. Assumptions explicitly
+state multiplier, execution and marking intervals,
+latency, candle-field rules, half-spread, additional slippage, fee rate, maximum oracle age, and the
+failure policy. Only full modeled fills at adjusted execution-candle opens and candle-close marking
+proxies are supported. These are retrospective modeling assumptions, not evidence of executable
+prices.
+
+The study is start-inclusive/end-exclusive. A candle open equal to decision plus latency is
+eligible; a future candle may price its future fill but cannot revise the earlier intent. The final
+completed marking candle is valued at the end boundary only when the ending position remains open.
+Actual funding retains its exchange event
+timestamp, uses the inclusive one-second hourly grid tolerance without timestamp rewriting, and
+uses only the latest validated official oracle at or before settlement. Same-time ordering remains
+funding, fill, mark. Receipt, retrieval, and ingestion clocks are lineage only.
+
+Selection fails closed on missing, partial, stale, conflicting, off-grid, out-of-range,
+wrong-instrument, predicted, unsupported-lineage, insufficient-fill, or missing-terminal-mark data.
+No interpolation, imputation, candle high/low crossing, partial fills, queues, impact, margin,
+leverage, or liquidation is introduced. Curated candle uniqueness is enforced by storage and
+ingestion; rejected conflicting raw recollections are not reconstructed by this adapter.
+
+Artifacts classify observed, supplied, modeled, and calculated values separately. Portable
+analytical hashes cover canonical selected values, schedule, and assumptions without SQLite IDs or
+operational receipt/ingestion/retrieval clocks. A separate source-lineage hash covers validated
+collector and immutable archive identities. Local row and run IDs remain incidental audit fields,
+not portable content identity. Scenario and accounting-engine identities are also hashed. If only
+ingestion-run IDs or clocks change, analytical and source-lineage hashes do not; if immutable source
+lineage changes while market values remain equal, analytical hashes stay fixed and the lineage and
+provenance-carrying scenario hashes change. Every fill traces its intent, candle row, assumption
+set, reference price, adjustments, and final modeled price. `scenario.json`, `assembly.json`,
+`assembly.md`, and `manifest.json` are deterministic and protect differing existing output.
+
+Exit criterion: synthetic database-to-scenario-to-accounting fixtures reconcile hand-calculated
+price P&L, funding, fees, slippage attribution, and equity; identical inputs produce byte-identical
+artifacts; and the generated scenario round-trips through the installed accounting CLI.
+
 ### Phase 4C - Basis and microstructure
 
 Add spot and dated-futures references, trades, liquidations, and validated order-book ingestion. Research basis decomposition, depth, imbalance, spread, impact, latency, and capacity. Move high-frequency tables to partitioned PostgreSQL or columnar files only when measured volume justifies it.

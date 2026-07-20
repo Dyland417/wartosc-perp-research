@@ -16,6 +16,7 @@ from .engine import (
     FillEvent,
     FundingEvent,
     MarkEvent,
+    ScenarioProvenance,
 )
 
 
@@ -111,6 +112,26 @@ def _event(value: object, index: int) -> FundingEvent | FillEvent | MarkEvent:
     raise ValueError(f"events[{index}].type must be one of: fill, funding, mark")
 
 
+def _provenance(value: object) -> ScenarioProvenance:
+    data = _object(value, "Backtest input provenance")
+    allowed = {
+        "assembly_schema_version",
+        "schedule_id",
+        "assumption_set_id",
+        "assumption_set_version",
+        "position_schedule_sha256",
+        "execution_assumptions_sha256",
+        "selected_candles_sha256",
+        "selected_funding_sha256",
+        "selected_oracle_alignments_sha256",
+        "source_lineage_sha256",
+        "accounting_engine_version",
+        "accounting_engine_sha256",
+    }
+    _validate_keys(data, allowed=allowed, required=allowed, context="Backtest input provenance")
+    return ScenarioProvenance(**data)
+
+
 def load_backtest_scenario(path: Path) -> BacktestScenario:
     """Load a versioned scenario without accepting ambiguous fields or binary floats."""
 
@@ -137,12 +158,18 @@ def load_backtest_scenario(path: Path) -> BacktestScenario:
         "initial_cash",
         "contract_multiplier",
         "knowledge_mode",
+        "provenance",
         "events",
     }
     required = {"schema_version", "name", "exchange", "symbol", "initial_cash", "events"}
     _validate_keys(data, allowed=allowed, required=required, context="Backtest input")
-    if isinstance(data["schema_version"], bool) or data["schema_version"] != 1:
-        raise ValueError("Backtest input 'schema_version' must be 1")
+    if isinstance(data["schema_version"], bool) or data["schema_version"] not in {1, 2}:
+        raise ValueError("Backtest input 'schema_version' must be 1 or 2")
+    schema_version = data["schema_version"]
+    if schema_version == 1 and "provenance" in data:
+        raise ValueError("Backtest input schema version 1 must not contain provenance")
+    if schema_version == 2 and "provenance" not in data:
+        raise ValueError("Backtest input 'schema_version' 2 requires provenance")
     raw_events = data["events"]
     if not isinstance(raw_events, list):
         raise TypeError("'events' must be a JSON array")
@@ -170,4 +197,5 @@ def load_backtest_scenario(path: Path) -> BacktestScenario:
             data.get("knowledge_mode", BacktestKnowledgeMode.OBSERVED.value)
         ),
         events=events,
+        provenance=_provenance(data["provenance"]) if schema_version == 2 else None,
     )

@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from .engine import (
     BacktestResult,
+    BacktestScenario,
     FillEvent,
     FundingEvent,
     MarkEvent,
@@ -75,28 +76,47 @@ def _event_to_dict(event: FundingEvent | FillEvent | MarkEvent) -> dict[str, Any
     }
 
 
-def _scenario_to_dict(result: BacktestResult) -> dict[str, Any]:
-    scenario = result.scenario
-    return {
-        "schema_version": 1,
+def backtest_scenario_to_dict(scenario: BacktestScenario) -> dict[str, Any]:
+    """Return a strict scenario document that the scenario CLI can load unchanged."""
+
+    payload: dict[str, Any] = {
+        "schema_version": 2 if scenario.provenance is not None else 1,
         "name": scenario.name,
         "exchange": scenario.exchange,
         "symbol": scenario.symbol,
         "initial_cash": _number(scenario.initial_cash),
         "contract_multiplier": _number(scenario.contract_multiplier),
         "knowledge_mode": scenario.knowledge_mode.value,
-        "same_timestamp_event_order": ["funding", "fill", "mark"],
         "events": [_event_to_dict(event) for event in ordered_events(scenario.events)],
     }
+    if scenario.provenance is not None:
+        provenance = scenario.provenance
+        payload["provenance"] = {
+            "assembly_schema_version": provenance.assembly_schema_version,
+            "schedule_id": provenance.schedule_id,
+            "assumption_set_id": provenance.assumption_set_id,
+            "assumption_set_version": provenance.assumption_set_version,
+            "position_schedule_sha256": provenance.position_schedule_sha256,
+            "execution_assumptions_sha256": provenance.execution_assumptions_sha256,
+            "selected_candles_sha256": provenance.selected_candles_sha256,
+            "selected_funding_sha256": provenance.selected_funding_sha256,
+            "selected_oracle_alignments_sha256": provenance.selected_oracle_alignments_sha256,
+            "source_lineage_sha256": provenance.source_lineage_sha256,
+            "accounting_engine_version": provenance.accounting_engine_version,
+            "accounting_engine_sha256": provenance.accounting_engine_sha256,
+        }
+    return payload
 
 
 def backtest_result_to_dict(result: BacktestResult) -> dict[str, Any]:
     """Serialize all calculations as stable strings, never JSON binary floats."""
 
+    scenario_document = backtest_scenario_to_dict(result.scenario)
+    scenario_document["same_timestamp_event_order"] = ["funding", "fill", "mark"]
     return {
         "schema_version": 1,
         "study_type": "deterministic_perpetual_accounting_simulation",
-        "scenario": _scenario_to_dict(result),
+        "scenario": scenario_document,
         "funding_sign_convention": {
             "formula": "-signed_position_size * contract_multiplier * oracle_price * funding_rate",
             "positive_rate": "long pays; short receives",
@@ -300,7 +320,10 @@ def write_backtest_report(
     ).encode("utf-8")
     markdown_content = render_backtest_markdown(result).encode("utf-8")
     scenario_content = json.dumps(
-        _scenario_to_dict(result), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        backtest_scenario_to_dict(result.scenario),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
     ).encode("utf-8")
     manifest = {
         "schema_version": 1,

@@ -30,8 +30,10 @@ explicitly labeled retrospective exports with deterministic manifests and covera
 
 Phase 4B begins the funding-aware P&L layer with a deterministic, single-instrument accounting
 kernel. It consumes explicit fill, funding, and valuation events; reconciles price P&L, oracle-based
-funding cash flows, fees, and slippage attribution; and produces deterministic reports. It does not
-yet generate strategies or infer executable fills from candles.
+funding cash flows, fees, and slippage attribution; and produces deterministic reports. Checkpoint
+3 adds a strict database-to-scenario compiler for externally supplied target positions, with
+explicit latency/cost assumptions, fail-closed data selection, and row-level provenance. It does
+not generate strategies or claim candle-based fills were executable.
 
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
@@ -62,6 +64,8 @@ signals -> backtests              costs, capacity, leverage, risk
 The importable package lives under `src/wartosc_perp_research/`; `data/` is only a local dataset landing zone, and `research/` is the notebook workspace. This avoids making a generic `data` package and prevents exploratory notebooks from becoming implicit production dependencies.
 
 See [docs/architecture.md](docs/architecture.md) for component boundaries, schema decisions, missing pieces, and the phased roadmap.
+See [docs/scenario-assembly.md](docs/scenario-assembly.md) for the checkpoint-3 contracts,
+look-ahead policy, boundary semantics, and failure rules.
 
 ## Repository layout
 
@@ -407,6 +411,43 @@ database failures exit `1`. This is a retrospective aligned dataset, not a strat
 Funding and normalized oracle database identifiers are included on every applicable CSV row;
 retrieval timestamps remain in raw/relational provenance but are intentionally excluded from
 analytical artifacts and their hashes.
+
+## Deterministic database-to-scenario assembly
+
+Compile curated candles, actual funding, validated official oracle alignments, a researcher-supplied
+target schedule, and an explicit assumption set into a strict scenario:
+
+```text
+wpr backtest assemble \
+  --database work/research.db \
+  --schedule position-schedule.json \
+  --assumptions execution-assumptions.json \
+  --output outputs/scenario-study
+```
+
+The command writes `scenario.json`, `assembly.json`, `assembly.md`, and `manifest.json`; it does not
+run accounting automatically. Run the generated scenario separately with `wpr backtest scenario`.
+All schedule and financial-assumption values are exact quoted Decimal strings. Targets are signed
+desired positions rather than trade deltas, zero is explicit flat, and unchanged targets produce no
+fill. The compiler cannot prove how the external schedule was produced; it may contain look-ahead
+bias unless its producer separately establishes point-in-time signal provenance.
+
+The initial execution model uses the first complete candle open at or after the explicit latency
+boundary. Buys are adjusted upward and sells downward using required half-spread and slippage rates;
+fees flow to the accounting engine. Marks use labeled candle-close proxies. Neither candle field is
+renamed as mark, index, oracle, or proof of an executable price. Funding alone uses the validated
+official oracle observation at or before settlement.
+
+Assembly is start-inclusive/end-exclusive. If the ending position is open, the last completed
+marking candle supplies a valuation at the end boundary; a flat ending position requires no
+terminal mark. Same-time accounting remains funding, then fill, then mark. Missing, stale,
+conflicting, partial, off-grid, wrongly sourced, or unproven required data fails rather than being
+skipped or filled. Portable market-content hashes exclude database IDs and operational clocks;
+source lineage is hashed separately, while incidental local IDs remain visible only in audit rows.
+Generated artifacts contain no report-generation clock and are byte-identical for identical full
+inputs. See
+[the scenario assembly specification](docs/scenario-assembly.md) for the complete contracts and
+look-ahead rules.
 
 ## Funding research workflow
 

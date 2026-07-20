@@ -14,10 +14,16 @@ from typing import Any
 
 from wartosc_perp_research.backtests import (
     BacktestOutputError,
+    ScenarioAssemblyError,
+    ScenarioAssemblyOutputError,
+    assemble_scenario_from_database,
     backtest_result_to_dict,
     load_backtest_scenario,
+    load_execution_assumptions,
+    load_position_schedule,
     run_backtest,
     write_backtest_report,
+    write_scenario_assembly,
 )
 from wartosc_perp_research.collectors import TimeRange
 from wartosc_perp_research.collectors.hyperliquid import HyperliquidCollector
@@ -219,6 +225,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Replace existing simulation files when their contents differ",
+    )
+    backtest_assemble = backtest_commands.add_parser(
+        "assemble", help="Compile curated data and supplied target intents into a scenario"
+    )
+    backtest_assemble.add_argument("--database", type=Path, required=True)
+    backtest_assemble.add_argument("--schedule", type=Path, required=True)
+    backtest_assemble.add_argument("--assumptions", type=Path, required=True)
+    backtest_assemble.add_argument("--output", type=Path, required=True)
+    backtest_assemble.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing assembly files when their contents differ",
     )
     return parser
 
@@ -706,11 +724,58 @@ def _run_backtest_scenario(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _database_from_file(path: Path) -> Database:
+    path = Path(path).expanduser().absolute()
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise ResearchRequestError("Database path must not contain symbolic links")
+    if not path.exists() or not path.is_file():
+        raise ResearchRequestError(f"Database is not a regular file: {path}")
+    return Database(f"sqlite+pysqlite:///{path.as_posix()}")
+
+
+def _run_backtest_assemble(args: argparse.Namespace) -> dict[str, Any]:
+    database: Database | None = None
+    try:
+        schedule = load_position_schedule(args.schedule)
+        assumptions = load_execution_assumptions(args.assumptions)
+        database = _database_from_file(args.database)
+        assembly = assemble_scenario_from_database(
+            database,
+            schedule=schedule,
+            assumptions=assumptions,
+        )
+        paths = write_scenario_assembly(assembly, args.output, overwrite=args.overwrite)
+    except (ScenarioAssemblyError, ScenarioAssemblyOutputError, TypeError, ValueError) as exc:
+        raise ResearchRequestError(str(exc)) from exc
+    finally:
+        if database is not None:
+            database.dispose()
+    return {
+        "status": "complete",
+        "study_type": "deterministic_database_to_scenario_assembly",
+        "exchange": assembly.schedule.exchange,
+        "symbol": assembly.schedule.instrument,
+        "intent_count": len(assembly.schedule.intents),
+        "modeled_fill_count": len(assembly.fill_traces),
+        "event_count": len(assembly.scenario.events),
+        "scenario_sha256": assembly.hashes["scenario_sha256"],
+        "scenario_json": str(paths.scenario_json),
+        "assembly_json": str(paths.assembly_json),
+        "assembly_markdown": str(paths.assembly_markdown),
+        "manifest_json": str(paths.manifest_json),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "backtest":
-            output: dict[str, Any] = _run_backtest_scenario(args)
+            output: dict[str, Any] = (
+                _run_backtest_assemble(args)
+                if args.backtest_command == "assemble"
+                else _run_backtest_scenario(args)
+            )
         else:
             settings = load_settings(args.config)
             if args.command == "db":

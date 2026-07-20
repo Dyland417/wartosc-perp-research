@@ -56,6 +56,9 @@ class StoredFundingEvent:
     received_at: datetime
     ingested_at: datetime
     ingestion_run_id: int | None
+    ingestion_run_status: str | None = None
+    ingestion_run_dataset: str | None = None
+    ingestion_run_collector: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "event_time", _utc(self.event_time, "event_time"))

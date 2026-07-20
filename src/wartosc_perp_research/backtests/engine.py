@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import TypeAlias
 
 BACKTEST_DECIMAL_PRECISION = 80
+ACCOUNTING_ENGINE_VERSION = "1"
 
 
 class BacktestKnowledgeMode(StrEnum):
@@ -16,6 +17,49 @@ class BacktestKnowledgeMode(StrEnum):
 
     OBSERVED = "observed"
     FINALIZED_RETROSPECTIVE = "finalized_retrospective"
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioProvenance:
+    """Deterministic source references carried by an assembled scenario."""
+
+    assembly_schema_version: int
+    schedule_id: str
+    assumption_set_id: str
+    assumption_set_version: int
+    position_schedule_sha256: str
+    execution_assumptions_sha256: str
+    selected_candles_sha256: str
+    selected_funding_sha256: str
+    selected_oracle_alignments_sha256: str
+    source_lineage_sha256: str
+    accounting_engine_version: str
+    accounting_engine_sha256: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.assembly_schema_version, bool) or self.assembly_schema_version != 1:
+            raise ValueError("'assembly_schema_version' must be 1")
+        if (
+            isinstance(self.assumption_set_version, bool)
+            or not isinstance(self.assumption_set_version, int)
+            or self.assumption_set_version <= 0
+        ):
+            raise ValueError("'assumption_set_version' must be a positive integer")
+        for field_name in ("schedule_id", "assumption_set_id", "accounting_engine_version"):
+            object.__setattr__(self, field_name, _text(getattr(self, field_name), field_name))
+        for field_name in (
+            "position_schedule_sha256",
+            "execution_assumptions_sha256",
+            "selected_candles_sha256",
+            "selected_funding_sha256",
+            "selected_oracle_alignments_sha256",
+            "source_lineage_sha256",
+            "accounting_engine_sha256",
+        ):
+            value = _text(getattr(self, field_name), field_name).lower()
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"'{field_name}' must be a lowercase SHA-256 digest")
+            object.__setattr__(self, field_name, value)
 
 
 def _text(value: str, field_name: str) -> str:
@@ -187,6 +231,7 @@ class BacktestScenario:
     contract_multiplier: Decimal
     events: tuple[BacktestEvent, ...]
     knowledge_mode: BacktestKnowledgeMode = BacktestKnowledgeMode.OBSERVED
+    provenance: ScenarioProvenance | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _text(self.name, "name"))
@@ -201,6 +246,8 @@ class BacktestScenario:
             _positive_decimal(self.contract_multiplier, "contract_multiplier"),
         )
         object.__setattr__(self, "knowledge_mode", BacktestKnowledgeMode(self.knowledge_mode))
+        if self.provenance is not None and not isinstance(self.provenance, ScenarioProvenance):
+            raise TypeError("'provenance' must be ScenarioProvenance or None")
         events = tuple(self.events)
         if not events:
             raise ValueError("A backtest scenario requires at least one event")

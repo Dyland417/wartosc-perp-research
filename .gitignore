@@ -38,6 +38,9 @@ manifest.json
 backtest-result.json
 backtest-result.md
 backtest-manifest.json
+scenario.json
+assembly.json
+assembly.md
 *.csv.lz4
 *.csv.lz4.provenance.json
 aligned-observations.csv
