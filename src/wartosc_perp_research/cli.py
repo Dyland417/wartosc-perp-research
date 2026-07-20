@@ -11,6 +11,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from wartosc_perp_research.backtests import (
+    BacktestOutputError,
+    backtest_result_to_dict,
+    load_backtest_scenario,
+    run_backtest,
+    write_backtest_report,
+)
 from wartosc_perp_research.collectors import TimeRange
 from wartosc_perp_research.collectors.hyperliquid import HyperliquidCollector
 from wartosc_perp_research.config import Settings, load_settings
@@ -117,6 +124,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Replace existing export files when their contents differ",
+    )
+
+    backtest = commands.add_parser(
+        "backtest", help="Run explicit deterministic accounting simulations"
+    )
+    backtest_commands = backtest.add_subparsers(dest="backtest_command", required=True)
+    backtest_scenario = backtest_commands.add_parser(
+        "scenario", help="Run a versioned JSON funding/P&L scenario"
+    )
+    backtest_scenario.add_argument("--input", type=Path, required=True)
+    backtest_scenario.add_argument("--output", type=Path, required=True)
+    backtest_scenario.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing simulation files when their contents differ",
     )
     return parser
 
@@ -439,23 +461,50 @@ def _stored_candle(record: CandleRecord) -> StoredCandle:
     )
 
 
+def _run_backtest_scenario(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        scenario = load_backtest_scenario(args.input)
+        result = run_backtest(scenario)
+        paths = write_backtest_report(result, args.output, overwrite=args.overwrite)
+    except (BacktestOutputError, TypeError, ValueError) as exc:
+        raise ResearchRequestError(str(exc)) from exc
+    summary = backtest_result_to_dict(result)["results"]
+    return {
+        "status": "complete",
+        "study_type": "deterministic_perpetual_accounting_simulation",
+        "scenario": scenario.name,
+        "exchange": scenario.exchange,
+        "symbol": scenario.symbol,
+        "knowledge_mode": scenario.knowledge_mode.value,
+        "event_count": len(result.ledger),
+        "ending_equity": summary["ending_equity"],
+        "total_pnl": summary["total_pnl"],
+        "result_json": str(paths.result_json),
+        "result_markdown": str(paths.result_markdown),
+        "manifest_json": str(paths.manifest_json),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        settings = load_settings(args.config)
-        if args.command == "db":
-            database = Database(settings.database.url, echo=settings.database.echo)
-            try:
-                database.create_schema()
-            finally:
-                database.dispose()
-            output: dict[str, Any] = {"status": "ok", "database": settings.database.url}
-        elif args.command == "hyperliquid":
-            output = asyncio.run(_run_hyperliquid(args, settings))
-        elif args.research_command == "funding":
-            output = _run_funding_research(args, settings)
+        if args.command == "backtest":
+            output: dict[str, Any] = _run_backtest_scenario(args)
         else:
-            output = _run_price_research(args, settings)
+            settings = load_settings(args.config)
+            if args.command == "db":
+                database = Database(settings.database.url, echo=settings.database.echo)
+                try:
+                    database.create_schema()
+                finally:
+                    database.dispose()
+                output = {"status": "ok", "database": settings.database.url}
+            elif args.command == "hyperliquid":
+                output = asyncio.run(_run_hyperliquid(args, settings))
+            elif args.research_command == "funding":
+                output = _run_funding_research(args, settings)
+            else:
+                output = _run_price_research(args, settings)
     except ResearchRequestError as exc:
         print(json.dumps({"status": "invalid_request", "error": str(exc)}), file=sys.stderr)
         return 2

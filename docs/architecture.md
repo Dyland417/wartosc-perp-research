@@ -63,7 +63,11 @@ Raw payloads are independent of relational storage. Each successful response is 
 
 Notebooks are consumers, not architecture. Reusable estimators and transformations graduate into `wartosc_perp_research.research` with tests. The funding research vertical separates pure calculations (`funding.py`), exchange-event-time queries (`funding_repository.py`), and deterministic serialization (`funding_report.py`). Reports contain no generation timestamp, never fill gaps, and serialize Decimal results as strings so identical inputs produce identical bytes.
 
-Strategies should consume point-in-time features and emit desired exposures or signals; they should not issue orders. Backtests should later own clock progression, portfolio accounting, fees, slippage, funding cash flows, margin, liquidation rules, and capacity. The current funding study is explicitly not a backtest.
+Strategies should consume point-in-time features and emit desired exposures or signals; they should
+not issue orders. The Phase 4B accounting kernel owns deterministic event ordering, position and
+cash accounting, price P&L, funding cash flows, fees, and slippage attribution for explicit events.
+A later strategy engine will own signal scheduling, fill generation, margin, liquidation, and
+capacity. The descriptive funding study remains explicitly separate from simulation.
 
 ## Missing components
 
@@ -124,7 +128,7 @@ Exit criterion met for the single-venue MVP: identical windows over identical cu
 byte-identical reports with no forward-filled observations, ambiguous duplicates, or hidden
 generation timestamps. Cross-venue spread research remains deferred.
 
-### Phase 4A - Historical price-data foundation (implemented locally)
+### Phase 4A - Historical price-data foundation (implemented and published)
 
 The Hyperliquid adapter collects the public `candleSnapshot` response for all currently documented
 intervals and archives every response before normalization. `CandleRecord` preserves Decimal OHLCV,
@@ -160,17 +164,49 @@ The price export workflow produces a stable CSV, JSON coverage data, a Markdown 
 and a manifest containing hashes of their exact bytes. It has no generation timestamp, uses stable
 ordering, protects conflicting and unsafe output paths, does not impute missing bars, and reports
 the 5,000-candle retention limitation. This is a data checkpoint, not a return calculation or
-backtest; Phase 4B is not implemented here.
+backtest; those responsibilities remain outside the candle export itself.
 
-### Phase 4B - Basis and microstructure
+### Phase 4B - Deterministic funding-aware accounting (checkpoint 1 implemented)
+
+The first Phase 4B checkpoint is a pure, single-instrument simulation kernel driven by versioned
+JSON scenarios. It orders events by UTC exchange time, with funding before fills and fills before
+valuation marks at the same timestamp. This ensures a decision made at settlement cannot receive
+funding retroactively. Input events must be nondecreasing and explicitly UTC. Sequence numbers
+provide stable ordering within one event type; multiple same-type events at one timestamp require
+explicit unique sequence fields, so JSON order cannot change the result.
+
+The Decimal ledger tracks signed base quantity, weighted average entry, realized and unrealized
+linear-perpetual P&L, cash, equity, explicit fees, and slippage attribution. Funding cash flow is
+`-position_size * contract_multiplier * oracle_price * funding_rate`; candle close is never silently
+used as the oracle, and its source label must explicitly identify oracle provenance. Scenarios begin
+flat, so initial equity equals initial cash. Every ledger step enforces the cash identity
+`initial_cash + cumulative_realized + cumulative_funding - cumulative_fees`; every valued step
+also enforces `equity = cash + unrealized`. Signed marked notional is exposure rather than an asset
+value and is not added to equity.
+
+Inputs must label execution, reference, oracle, and valuation price sources. Reports retain the
+knowledge mode, event assumptions, limitations, complete ledger, and exact-byte manifest hashes.
+Execution prices already carry economic slippage into price P&L; reference-price slippage is
+attribution only. Fees use absolute execution notional and explicit nonnegative scenario rates.
+Maker rebates are not supported and venue fee tiers are not hard-coded.
+The kernel assumes explicit full fills and contains no signal generator, order execution, database
+mutation, margin, leverage, liquidation, latency, partial-fill, impact, or capacity model.
+
+Exit criterion for this checkpoint: hand-calculated long, short, reduction, flip, fee, positive and
+negative funding, and same-timestamp fixtures reconcile exactly and identical inputs produce
+byte-identical reports.
+
+### Phase 4C - Basis and microstructure
 
 Add spot and dated-futures references, trades, liquidations, and validated order-book ingestion. Research basis decomposition, depth, imbalance, spread, impact, latency, and capacity. Move high-frequency tables to partitioned PostgreSQL or columnar files only when measured volume justifies it.
 
 Exit criterion: candidate opportunities include executable size, synchronized timestamps, fees, slippage, and venue constraints.
 
-### Phase 5 — Strategy and backtest framework
+### Phase 5 — Strategy and full backtest framework
 
-Create a point-in-time event loop and portfolio ledger. Model funding cash flows, commissions, latency, partial fills, margin, leverage limits, liquidation, and capital allocation. Strategies remain pure and execution-independent.
+Build point-in-time signal scheduling and data-to-event adapters on the Phase 4B ledger. Add
+commission schedules, latency, partial fills, margin, leverage limits, liquidation, and capital
+allocation. Strategies remain pure and execution-independent.
 
 Exit criterion: deterministic backtests prevent look-ahead, include realistic costs, expose capacity, and pass accounting invariants.
 

@@ -35,6 +35,9 @@ candles.csv
 coverage.json
 coverage.md
 manifest.json
+backtest-result.json
+backtest-result.md
+backtest-manifest.json
 
 # Local databases.
 *.db

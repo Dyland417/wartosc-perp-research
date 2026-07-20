@@ -28,6 +28,11 @@ Phase 4A adds the historical price-data foundation: archived Hyperliquid candle 
 exact-decimal OHLCV storage, revision-aware idempotent ingestion, strict observed-time reads, and
 explicitly labeled retrospective exports with deterministic manifests and coverage reports.
 
+Phase 4B begins the funding-aware P&L layer with a deterministic, single-instrument accounting
+kernel. It consumes explicit fill, funding, and valuation events; reconciles price P&L, oracle-based
+funding cash flows, fees, and slippage attribution; and produces deterministic reports. It does not
+yet generate strategies or infer executable fills from candles.
+
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
 ## Architecture
@@ -75,12 +80,15 @@ src/wartosc_perp_research/
   research/funding_report.py           deterministic JSON and Markdown reports
   research/price_repository.py         point-in-time completed-candle queries
   research/price_export.py             deterministic price exports and coverage manifests
+  backtests/engine.py                   event clock and Decimal position/cash ledger
+  backtests/scenario.py                 strict versioned JSON scenario loading
+  backtests/report.py                   deterministic simulation reports and manifests
   resources/exchanges.yaml             packaged non-secret defaults
   storage/database.py                  engine and transaction lifecycle
   storage/models.py                    relational schema
   storage/raw_archive.py               append-only response envelopes
   cli.py                               `wpr` command implementation
-  research/ strategies/ backtests/     future reusable components
+  strategies/                          future execution-independent signals
 tests/                                  foundation tests
 ```
 
@@ -194,8 +202,109 @@ strict: a candle must have reached `T + 1ms` and both its receipt and ingestion 
 or before the cutoff. The research CLI explicitly uses `finalized_retrospective` mode so cached
 backfills can be exported; its JSON, Markdown, manifest, and CLI result label that mode and warn that
 Hyperliquid exposes neither revision history nor proof of when a backfilled candle first became
-observable. Retrospective output must not be mistaken for strict knowledge-time data. No
-interpolation, forward fill, partial candle, P&L, or Phase 4B functionality is included.
+observable. Retrospective output must not be mistaken for strict knowledge-time data. The candle
+workflow itself performs no interpolation, forward fill, partial-candle use, or P&L calculation.
+
+## Deterministic funding-aware accounting
+
+Phase 4B starts with an explicit-event accounting kernel rather than an automatic strategy runner.
+This keeps fill, price-source, and observability assumptions inspectable while the historical oracle
+price dataset is still missing. The official [Hyperliquid funding documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding)
+specifies that settlement uses position size, oracle price, and funding rate. The kernel therefore
+calculates cash flow as:
+
+```text
+-signed_position_size * contract_multiplier * oracle_price * funding_rate
+```
+
+Positive funding therefore makes a long pay and a short receive. Same-timestamp events always
+process funding first, then fills, then valuation marks. A fill created at a funding timestamp cannot
+retroactively earn that settlement; an existing position closed at that timestamp receives or pays
+funding before the exit fill. Events must be supplied in nondecreasing UTC time. When multiple
+events of one type share a timestamp, every one must declare a unique nonnegative `sequence`;
+canonical precedence and sequence—not JSON order—determine the ledger.
+
+Every scenario starts flat, so initial equity equals initial cash. Opening or increasing a linear
+perpetual position does not spend notional principal. The engine enforces these identities after
+each event:
+
+```text
+cash = initial_cash + cumulative_realized_price_pnl
+       + cumulative_funding_cash_flow - cumulative_fees
+
+equity = cash + unrealized_price_pnl
+
+equity - initial_equity = realized_price_pnl + unrealized_price_pnl
+                          + funding_cash_flow - fees
+```
+
+Signed marked notional is reported as exposure but is never added to cash or equity. A fill's
+execution price is the economic price used for P&L. Slippage relative to the explicit reference
+price is attribution only and is not deducted again. Fees equal absolute execution notional times
+the scenario's explicit nonnegative fee rate. Negative fee rates and maker rebates are not supported
+in this checkpoint; current venue fee tiers are deliberately not hard-coded.
+
+Run a versioned JSON scenario:
+
+```text
+wpr backtest scenario \
+  --input work/btc-accounting-scenario.json \
+  --output outputs/btc-accounting
+```
+
+Minimal scenario shape:
+
+```json
+{
+  "schema_version": 1,
+  "name": "BTC explicit-event fixture",
+  "exchange": "hyperliquid",
+  "symbol": "BTC",
+  "initial_cash": "10000",
+  "contract_multiplier": "1",
+  "knowledge_mode": "observed",
+  "events": [
+    {
+      "type": "fill",
+      "event_time": "2026-01-01T00:00:00Z",
+      "quantity_delta": "1",
+      "execution_price": "100000",
+      "reference_price": "99990",
+      "price_source": "explicit_assumed_fill",
+      "reference_price_source": "explicit_reference",
+      "fee_rate": "0.00045"
+    },
+    {
+      "type": "funding",
+      "event_time": "2026-01-01T01:00:00Z",
+      "rate": "0.0001",
+      "oracle_price": "100100",
+      "oracle_price_source": "hyperliquid_oracle"
+    },
+    {
+      "type": "mark",
+      "event_time": "2026-01-01T02:00:00Z",
+      "price": "100500",
+      "price_source": "explicit_valuation_mark"
+    }
+  ]
+}
+```
+
+The input declares `schema_version`, scenario identity, initial cash, contract multiplier,
+knowledge mode, and explicit `fill`, `funding`, and `mark` events. Fill events require both an
+execution price and a labeled reference price. Funding events require a labeled oracle price; the
+source label itself must explicitly identify an oracle source, and the loader never substitutes
+candle close, mark, index, mid, or generic price. Oracle provenance is asserted by the scenario and
+is not independently verified by the accounting kernel. Decimal JSON values may be quoted strings
+or decimal JSON number literals; both are parsed directly as `Decimal` and never pass through binary
+floating-point.
+
+The workflow writes `backtest-result.json`, `backtest-result.md`, and
+`backtest-manifest.json`. Outputs contain no generation clock and repeated identical scenarios are
+byte-stable. This first checkpoint assumes full fills and does not model signals, margin, leverage,
+liquidation, partial fills, latency, capacity, market impact, or execution uncertainty. These are
+scenario-supplied accounting simulations, not automatically generated historical backtests.
 
 ## Funding research workflow
 
@@ -259,8 +368,9 @@ GitHub Actions runs these checks against every currently supported Python versio
 - order placement, key management, or execution;
 - schedulers and always-on streaming services;
 - schema migrations while the pre-1.0 local schema is still being established;
-- a generic backtest engine before data semantics are validated;
-- price/funding P&L, return calculations, or strategy signals in Phase 4A;
+- automatic strategy generation or candle-to-fill inference;
+- margin, liquidation, cross-collateral, partial-fill, latency, and capacity models;
+- automatic alignment of cached candles and funding until historical oracle prices are available;
 - premature distributed infrastructure.
 
 ## License

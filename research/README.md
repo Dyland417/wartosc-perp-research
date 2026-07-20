@@ -50,4 +50,12 @@ bytes of every data artifact. Repeated identical runs are byte-stable. Existing 
 require `--overwrite`, while roots, symbolic-link path components, and non-regular targets are
 rejected. Candle values are exact `NUMERIC(38,18)`-representable Decimals, and OHLC is not a mark,
 index, oracle, mid, or execution price. Add `--collect` only when the public API should be queried
-before the cached retrospective export. This workflow contains no P&L, backtest, or Phase 4B code.
+before the cached retrospective export. This price workflow does not calculate P&L; the separate
+Phase 4B accounting kernel accepts only explicit, labeled simulation events.
+
+The Phase 4B checkpoint is invoked with `wpr backtest scenario`. It starts flat, processes
+nondecreasing UTC events with funding before fills before marks, and requires explicit sequences
+for multiple same-type events at one timestamp. Cash and equity identities are checked after every
+event. Execution-price slippage is already economic P&L; reference-price slippage is attribution
+only. Oracle provenance remains scenario-supplied, so these deterministic artifacts are accounting
+simulations rather than automatically generated historical backtests.
