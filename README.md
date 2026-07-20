@@ -33,7 +33,11 @@ kernel. It consumes explicit fill, funding, and valuation events; reconciles pri
 funding cash flows, fees, and slippage attribution; and produces deterministic reports. Checkpoint
 3 adds a strict database-to-scenario compiler for externally supplied target positions, with
 explicit latency/cost assumptions, fail-closed data selection, and row-level provenance. It does
-not generate strategies or claim candle-based fills were executable.
+not generate strategies or claim candle-based fills were executable. Checkpoint 4A adds a pure
+Decimal performance-metrics kernel with audit and valuation curves, strict as-of sampling, P&L
+attribution, drawdown, coherent annualization, simple-return Sharpe-like, CAGR, turnover, event-time
+position duration, and valuation-observed notional exposure. Flat terminal accounting equity is
+retained without inventing a market price.
 
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
@@ -66,6 +70,8 @@ The importable package lives under `src/wartosc_perp_research/`; `data/` is only
 See [docs/architecture.md](docs/architecture.md) for component boundaries, schema decisions, missing pieces, and the phased roadmap.
 See [docs/scenario-assembly.md](docs/scenario-assembly.md) for the checkpoint-3 contracts,
 look-ahead policy, boundary semantics, and failure rules.
+See [docs/performance-metrics.md](docs/performance-metrics.md) for checkpoint-4A formulas,
+sampling rules, availability semantics, and interpretation limits.
 
 ## Repository layout
 
@@ -87,6 +93,7 @@ src/wartosc_perp_research/
   backtests/engine.py                   event clock and Decimal position/cash ledger
   backtests/scenario.py                 strict versioned JSON scenario loading
   backtests/report.py                   deterministic simulation reports and manifests
+  backtests/metrics.py                  pure Decimal curves and performance calculations
   resources/exchanges.yaml             packaged non-secret defaults
   storage/database.py                  engine and transaction lifecycle
   storage/models.py                    relational schema

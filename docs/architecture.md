@@ -296,6 +296,45 @@ Exit criterion: synthetic database-to-scenario-to-accounting fixtures reconcile 
 price P&L, funding, fees, slippage attribution, and equity; identical inputs produce byte-identical
 artifacts; and the generated scenario round-trips through the installed accounting CLI.
 
+### Phase 4B - Deterministic performance metrics (checkpoint 4A)
+
+The metrics kernel is a pure, typed consumer of `BacktestResult`; it never reruns accounting or
+creates events. An event-equity audit curve preserves canonical funding, fill, and mark order, while
+a separate valuation-equity curve requires unique market-mark timestamps. Duplicate or conflicting
+marks at one timestamp fail closed. An open ending requires the final market mark to reconcile
+ending equity. A flat ending after the last market mark instead receives one explicitly labeled
+terminal accounting valuation with no invented price or marked notional, preserving final cash,
+realized P&L, funding, fees, and equity. Scenario price-source labels remain intact, so candle closes
+stay explicitly identified as valuation proxies rather than venue marks, index, oracle, or
+executable prices.
+
+Regular-return metrics require a strict versioned sampling specification. Its inclusive UTC grid,
+anchor, interval, periods per year, maximum valuation age, and latest-at-or-before rule are all
+explicit. Every grid point records the selected valuation and exact age. Future values,
+interpolation, and silent filling are forbidden; stale or absent values make sampling incomplete.
+Equality at the maximum age is valid; one microsecond beyond it is stale. The interval multiplied by
+periods per year must equal the explicit seconds-per-year convention exactly, making hourly/8,760
+and daily/365 coherent for a 365-day year while contradictory inputs fail closed. Drawdown and
+marked-notional exposure use the irregular valuation curve, position-duration percentages use
+event-time fills, and the Sharpe-like metric uses only the regular sample.
+
+All financial calculations use local 80-digit, round-half-even Decimal contexts without changing
+global caller state. Simple returns, sample-standard-deviation annualized Sharpe-like values,
+elapsed-time CAGR, explicitly named CAGR-to-max-drawdown, gross two-sided turnover, and
+right-continuous event-time position duration and valuation-observed notional exposure are
+separately typed. Invalid contracts raise; insufficient
+valid data produces absent values with status, reason code, and detail rather than a numeric
+sentinel. Slippage remains attribution only, and engine P&L identities must reconcile exactly.
+
+This checkpoint emits no files and adds no CLI. See `docs/performance-metrics.md` for formulas and
+limitations. Candle-close bias, unobserved intrabar drawdowns, sampling-sensitive annualization,
+short-study risk, open unrealized ending P&L, lack of a benchmark, and omitted market impact,
+portfolio risk, margin, and liquidation are prominent warnings.
+
+Exit criterion: complete hand-calculated fixtures reconcile curves, returns, drawdown, turnover,
+exposure, Sharpe-like, CAGR, and CAGR-to-max-drawdown; incomplete and insolvent cases fail closed;
+same inputs produce equal typed results; and the caller's Decimal context remains unchanged.
+
 ### Phase 4C - Basis and microstructure
 
 Add spot and dated-futures references, trades, liquidations, and validated order-book ingestion. Research basis decomposition, depth, imbalance, spread, impact, latency, and capacity. Move high-frequency tables to partitioned PostgreSQL or columnar files only when measured volume justifies it.
