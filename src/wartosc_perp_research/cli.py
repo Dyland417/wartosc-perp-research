@@ -54,6 +54,24 @@ from wartosc_perp_research.research import (
     write_funding_report,
     write_price_export,
 )
+from wartosc_perp_research.research_tools import (
+    DEFAULT_REGISTRY,
+    TOOL_CATALOG_VERSION,
+    ResearchSessionConflictError,
+    ResearchSessionError,
+    ResearchSessionIntegrityError,
+    SafeToolPathError,
+    ToolContractError,
+    append_researcher_event,
+    create_research_session,
+    export_research_session,
+    invoke_research_tool,
+    load_researcher_event,
+    load_session_specification,
+    load_tool_request,
+    session_summary,
+    verify_research_session,
+)
 from wartosc_perp_research.storage import Database
 from wartosc_perp_research.storage.raw_archive import RawArchive
 
@@ -216,6 +234,54 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace existing alignment files when their contents differ",
     )
+
+    research_tools = research_commands.add_parser(
+        "tools", help="Discover the closed deterministic research-tool catalog"
+    )
+    research_tool_commands = research_tools.add_subparsers(
+        dest="research_tools_command", required=True
+    )
+    research_tool_commands.add_parser("list", help="List registered tool schemas")
+    research_tool_describe = research_tool_commands.add_parser(
+        "describe", help="Describe one registered tool"
+    )
+    research_tool_describe.add_argument("tool")
+    research_tool_describe.add_argument("--schema-version", type=int)
+
+    research_session = research_commands.add_parser(
+        "session", help="Manage an immutable deterministic research session"
+    )
+    research_session_commands = research_session.add_subparsers(
+        dest="research_session_command", required=True
+    )
+    session_create = research_session_commands.add_parser(
+        "create", help="Create a new append-only research session"
+    )
+    session_create.add_argument("--spec", type=Path, required=True)
+    session_create.add_argument("--output", type=Path, required=True)
+    session_invoke = research_session_commands.add_parser(
+        "invoke", help="Validate and invoke one registered tool inside a session"
+    )
+    session_invoke.add_argument("--session", type=Path, required=True)
+    session_invoke.add_argument("--request", type=Path, required=True)
+    session_append = research_session_commands.add_parser(
+        "append", help="Append a researcher-authored note, critique, or conclusion"
+    )
+    session_append.add_argument("--session", type=Path, required=True)
+    session_append.add_argument("--event", type=Path, required=True)
+    session_inspect = research_session_commands.add_parser(
+        "inspect", help="Inspect validated session history without checking artifacts"
+    )
+    session_inspect.add_argument("--session", type=Path, required=True)
+    session_verify = research_session_commands.add_parser(
+        "verify", help="Verify session chains and every referenced artifact hash"
+    )
+    session_verify.add_argument("--session", type=Path, required=True)
+    session_export = research_session_commands.add_parser(
+        "export", help="Write a clock-free deterministic portable session export"
+    )
+    session_export.add_argument("--session", type=Path, required=True)
+    session_export.add_argument("--output", type=Path, required=True)
 
     backtest = commands.add_parser(
         "backtest", help="Run explicit deterministic accounting simulations"
@@ -816,6 +882,60 @@ def _run_backtest_study(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _run_research_tools(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        if args.research_tools_command == "list":
+            return {
+                "catalog_version": TOOL_CATALOG_VERSION,
+                "status": "complete",
+                "tools": list(DEFAULT_REGISTRY.list()),
+            }
+        return {
+            "status": "complete",
+            "tool": DEFAULT_REGISTRY.describe(args.tool, args.schema_version),
+        }
+    except ToolContractError as exc:
+        raise ResearchRequestError(str(exc)) from exc
+
+
+def _run_research_session(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        command = args.research_session_command
+        if command == "create":
+            snapshot = create_research_session(load_session_specification(args.spec), args.output)
+            return {
+                "session": str(snapshot.path),
+                "status": "complete",
+                "summary": session_summary(snapshot),
+            }
+        if command == "invoke":
+            receipt = invoke_research_tool(args.session, load_tool_request(args.request))
+            return {"status": receipt.result.status.value, **receipt.to_dict()}
+        if command == "append":
+            snapshot = append_researcher_event(args.session, load_researcher_event(args.event))
+            return {"status": "complete", "summary": session_summary(snapshot)}
+        if command == "inspect":
+            snapshot = verify_research_session(args.session, verify_artifacts=False)
+            return {"status": "complete", "summary": session_summary(snapshot)}
+        if command == "verify":
+            snapshot = verify_research_session(args.session, verify_artifacts=True)
+            return {"status": "verified", "summary": session_summary(snapshot)}
+        output, digest = export_research_session(args.session, args.output)
+        return {
+            "output": str(output),
+            "sha256": digest,
+            "status": "complete",
+        }
+    except (ResearchSessionIntegrityError, ResearchSessionConflictError):
+        raise
+    except (
+        ResearchSessionError,
+        SafeToolPathError,
+        ToolContractError,
+    ) as exc:
+        raise ResearchRequestError(str(exc)) from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -826,6 +946,10 @@ def main(argv: list[str] | None = None) -> int:
                 output = _run_backtest_study(args)
             else:
                 output = _run_backtest_scenario(args)
+        elif args.command == "research" and args.research_command == "tools":
+            output = _run_research_tools(args)
+        elif args.command == "research" and args.research_command == "session":
+            output = _run_research_session(args)
         else:
             settings = load_settings(args.config)
             if args.command == "db":
@@ -853,4 +977,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "error", "error": str(exc)}), file=sys.stderr)
         return 1
     print(json.dumps(output, sort_keys=True))
+    if (
+        args.command == "research"
+        and args.research_command == "session"
+        and args.research_session_command == "invoke"
+        and output["status"] == "failed"
+    ):
+        return 1
     return 0

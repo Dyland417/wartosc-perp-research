@@ -41,6 +41,12 @@ retained without inventing a market price. Checkpoint 4B composes the database a
 engine, and metrics kernel into one offline historical-study command that emits a deterministic,
 transactional, provenance-hashed research bundle without duplicating any financial calculation.
 
+Phase 5 checkpoint 1 adds a closed, versioned interface over that mature study workflow and an
+immutable research-session record. The initial allowlist contains only `historical_study.run` and
+`historical_study.verify`. Sessions persist ordered requests, resolved input identities, results,
+warnings, failures, and relative artifact hashes using atomic append-only segments and separate
+integrity and portable analytical hash chains. There is still no LLM or autonomous Research Agent.
+
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
 ## Architecture
@@ -76,6 +82,8 @@ See [docs/performance-metrics.md](docs/performance-metrics.md) for checkpoint-4A
 sampling rules, availability semantics, and interpretation limits.
 See [docs/historical-study.md](docs/historical-study.md) for checkpoint-4B study specifications,
 artifact contracts, failure semantics, and deterministic output rules.
+See [docs/research-tools-and-sessions.md](docs/research-tools-and-sessions.md) for the Phase 5
+tool registry, session lifecycle, trust boundaries, hash chains, and retry behavior.
 
 ## Repository layout
 
@@ -100,6 +108,9 @@ src/wartosc_perp_research/
   backtests/metrics.py                  pure Decimal curves and performance calculations
   backtests/study.py                    strict study contract and component orchestration
   backtests/study_report.py             deterministic bundle serialization and promotion
+  research_tools/contracts.py           strict portable tool request/result envelopes
+  research_tools/registry.py            closed catalog and deterministic adapters
+  research_tools/sessions.py            append-only session persistence and export
   resources/exchanges.yaml             packaged non-secret defaults
   storage/database.py                  engine and transaction lifecycle
   storage/models.py                    relational schema
@@ -501,6 +512,51 @@ invalid specification/request or unsafe/conflicting output path. A hard failure 
 partial study directory. See [the historical-study contract](docs/historical-study.md) for the
 complete schema and artifact meanings.
 
+## Research tools and immutable sessions
+
+Discover the closed catalog without executing analysis:
+
+```text
+wpr research tools list
+wpr research tools describe historical_study.run
+```
+
+Create a session and invoke one validated tool:
+
+```text
+wpr research session create --spec session.json --output work/session
+wpr research session invoke --session work/session --request request.json
+wpr research session inspect --session work/session
+wpr research session verify --session work/session
+wpr research session export --session work/session --output outputs/session.json
+```
+
+Tool requests are closed JSON objects. They reject unknown fields, binary floats, non-finite
+numbers, unknown names or versions, absolute/escaping paths, and symbolic links. The session's
+parent directory is the explicit research root; all portable artifact references are relative to
+it. Tool adapters call the existing deterministic Python application functions directly and never
+shell out to Wartosc itself.
+
+Sessions are structured evidence stores, not conversation logs. They contain an immutable header
+and atomically appended event segments plus an explicit committed-head document for researcher
+objectives/notes, validated requests,
+resolved source hashes, results, warnings, failures, critiques, conclusions, and output artifact
+references. Identical retries over identical resolved inputs append nothing. A changed source
+creates a new attempt and can never silently replace prior evidence. Portable exports omit machine
+paths and operational timestamps.
+
+Historical-study invocation holds a SQLite reserved writer barrier from database hashing through
+all analytical reads and verifies the bytes again before output promotion. This binds the recorded
+resolved-input identity to the records actually used rather than relying only on before/after
+observations around an unlocked mutable database. Session invocation retains that barrier through
+durable result-event and head promotion.
+
+Exit `0` includes explicitly marked `incomplete` analytical results. Exit `1` covers recorded tool
+failure, integrity failure, or writer conflict. Exit `2` covers an invalid request, unsupported
+tool/version, or unsafe path. See
+[the research-tool and session contract](docs/research-tools-and-sessions.md) for the full catalog,
+failure taxonomy, persistence policy, and future-agent boundary.
+
 ## Funding research workflow
 
 Analyze actual funding already stored in the configured database:
@@ -567,6 +623,7 @@ GitHub Actions runs these checks against every currently supported Python versio
 - margin, liquidation, cross-collateral, partial-fill, latency, and capacity models;
 - automatic strategy-event generation from aligned funding and oracle data;
 - premature distributed infrastructure.
+- autonomous Research Agents, LLM SDKs, prompts, or hidden-reasoning storage.
 
 ## License
 

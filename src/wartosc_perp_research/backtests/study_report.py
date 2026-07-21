@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
@@ -65,6 +66,16 @@ _ARTIFACT_DEPENDENCIES = {
     "sampled_equity.csv": ["metrics.json"],
     "report.md": ["study.json", "assembly.json", "accounting.json", "metrics.json"],
 }
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(reparse_flag and attributes & reparse_flag)
 
 
 class HistoricalStudyOutputError(ValueError):
@@ -704,6 +715,14 @@ def _validate_dependency_graph(value: object) -> None:
         visit(artifact_name)
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def validate_historical_study_artifacts(bundle: HistoricalStudyArtifactBundle) -> None:
     if set(bundle.files) != set(_ARTIFACT_NAMES) or len(bundle.files) != len(_ARTIFACT_NAMES):
         raise HistoricalStudyOutputError("Historical-study bundle has unexpected artifacts")
@@ -718,6 +737,8 @@ def validate_historical_study_artifacts(bundle: HistoricalStudyArtifactBundle) -
     for name, record in files.items():
         if (
             not isinstance(record, Mapping)
+            or set(record) != {"sha256"}
+            or not _is_sha256(record.get("sha256"))
             or record.get("sha256") != hashlib.sha256(bundle.files[name]).hexdigest()
         ):
             raise HistoricalStudyOutputError(f"Artifact hash mismatch: {name}")
@@ -738,6 +759,64 @@ def validate_historical_study_artifacts(bundle: HistoricalStudyArtifactBundle) -
         specification = historical_study_specification_from_dict(study_document)
     except (TypeError, ValueError) as exc:
         raise HistoricalStudyOutputError("Normalized study artifact is invalid") from exc
+    expected_manifest_fields = {
+        "bundle_type",
+        "components",
+        "dependencies",
+        "ending_position_status",
+        "files",
+        "identity",
+        "market_data",
+        "schema_version",
+        "warning_summary",
+    }
+    if set(bundle.manifest) != expected_manifest_fields:
+        raise HistoricalStudyOutputError("Manifest fields are invalid")
+    if (
+        bundle.manifest.get("schema_version") != HISTORICAL_STUDY_BUNDLE_SCHEMA_VERSION
+        or bundle.manifest.get("bundle_type") != "deterministic_single_instrument_historical_study"
+    ):
+        raise HistoricalStudyOutputError("Manifest type or schema version is unsupported")
+    identity_fields = {
+        "accounting_result_sha256",
+        "analytical_identity_sha256",
+        "execution_assumptions_sha256",
+        "metrics_result_sha256",
+        "position_schedule_sha256",
+        "scenario_sha256",
+        "study_content_sha256",
+        "study_schema_version",
+    }
+    market_fields = {
+        "operational_retrieval_history",
+        "selected_candles_sha256",
+        "selected_funding_sha256",
+        "selected_oracle_alignments_sha256",
+        "source_lineage_sha256",
+    }
+    if not isinstance(identity, Mapping) or set(identity) != identity_fields:
+        raise HistoricalStudyOutputError("Manifest identity contract is invalid")
+    if not isinstance(market_data, Mapping) or set(market_data) != market_fields:
+        raise HistoricalStudyOutputError("Manifest market-data contract is invalid")
+    if market_data.get("operational_retrieval_history") != (
+        "excluded_from_portable_analytical_artifacts"
+    ):
+        raise HistoricalStudyOutputError("Operational retrieval-history policy is invalid")
+    if any(
+        not _is_sha256(value) for key, value in identity.items() if key != "study_schema_version"
+    ) or any(
+        not _is_sha256(market_data.get(key)) for key in market_fields if key.endswith("sha256")
+    ):
+        raise HistoricalStudyOutputError("Manifest contains an invalid SHA-256 identity")
+    for name, content in (
+        ("study.json", study_document),
+        ("scenario.json", scenario_document),
+        ("assembly.json", assembly_document),
+        ("accounting.json", accounting_document),
+        ("metrics.json", metrics_document),
+    ):
+        if bundle.files[name] != _json_bytes(content):
+            raise HistoricalStudyOutputError(f"Artifact is not canonical JSON: {name}")
     expected_hashes = {
         "study_content_sha256": canonical_sha256(study_document),
         "analytical_identity_sha256": canonical_sha256(
@@ -755,7 +834,21 @@ def validate_historical_study_artifacts(bundle: HistoricalStudyArtifactBundle) -
         raise HistoricalStudyOutputError("Study schema identity mismatch")
     _validate_dependency_graph(bundle.manifest.get("dependencies"))
     assembly_hashes = assembly_document.get("hashes")
-    if not isinstance(assembly_hashes, Mapping):
+    assembly_hash_fields = {
+        "accounting_engine_sha256",
+        "execution_assumptions_sha256",
+        "position_schedule_sha256",
+        "scenario_sha256",
+        "selected_candles_sha256",
+        "selected_funding_sha256",
+        "selected_oracle_alignments_sha256",
+        "source_lineage_sha256",
+    }
+    if (
+        not isinstance(assembly_hashes, Mapping)
+        or set(assembly_hashes) != assembly_hash_fields
+        or any(not _is_sha256(value) for value in assembly_hashes.values())
+    ):
         raise HistoricalStudyOutputError("Assembly hash table is invalid")
     for key in (
         "selected_candles_sha256",
@@ -765,6 +858,194 @@ def validate_historical_study_artifacts(bundle: HistoricalStudyArtifactBundle) -
     ):
         if market_data.get(key) != assembly_hashes.get(key):
             raise HistoricalStudyOutputError(f"Market-data identity hash mismatch: {key}")
+    if identity.get("position_schedule_sha256") != assembly_hashes.get(
+        "position_schedule_sha256"
+    ) or identity.get("execution_assumptions_sha256") != assembly_hashes.get(
+        "execution_assumptions_sha256"
+    ):
+        raise HistoricalStudyOutputError("Study-input identity hash mismatch")
+    if (
+        assembly_document.get("schema_version") != ASSEMBLY_SCHEMA_VERSION
+        or assembly_document.get("study_type") != "deterministic_database_to_scenario_assembly"
+        or assembly_document.get("position_schedule") != study_document.get("position_schedule")
+        or assembly_document.get("execution_assumptions")
+        != study_document.get("execution_assumptions")
+    ):
+        raise HistoricalStudyOutputError("Assembly and study contracts are inconsistent")
+    scenario_summary = assembly_document.get("scenario")
+    scenario_events = scenario_document.get("events")
+    if (
+        not isinstance(scenario_summary, Mapping)
+        or scenario_summary.get("file") != "scenario.json"
+        or not isinstance(scenario_events, list)
+        or scenario_summary.get("event_count") != len(scenario_events)
+    ):
+        raise HistoricalStudyOutputError("Scenario summary is inconsistent")
+    provenance = scenario_document.get("provenance")
+    provenance_fields = {
+        "accounting_engine_sha256",
+        "accounting_engine_version",
+        "assembly_schema_version",
+        "assumption_set_id",
+        "assumption_set_version",
+        "execution_assumptions_sha256",
+        "position_schedule_sha256",
+        "schedule_id",
+        "selected_candles_sha256",
+        "selected_funding_sha256",
+        "selected_oracle_alignments_sha256",
+        "source_lineage_sha256",
+    }
+    if (
+        not isinstance(provenance, Mapping)
+        or set(provenance) != provenance_fields
+        or scenario_document.get("schema_version") != 2
+        or any(
+            provenance.get(key) != assembly_hashes.get(key)
+            for key in (
+                "accounting_engine_sha256",
+                "execution_assumptions_sha256",
+                "position_schedule_sha256",
+                "selected_candles_sha256",
+                "selected_funding_sha256",
+                "selected_oracle_alignments_sha256",
+                "source_lineage_sha256",
+            )
+        )
+    ):
+        raise HistoricalStudyOutputError("Scenario provenance is inconsistent")
+    if (
+        provenance.get("assembly_schema_version") != ASSEMBLY_SCHEMA_VERSION
+        or provenance.get("accounting_engine_version") != ACCOUNTING_ENGINE_VERSION
+        or provenance.get("schedule_id") != specification.schedule.schedule_id
+        or provenance.get("assumption_set_id") != specification.assumptions.assumption_set_id
+        or provenance.get("assumption_set_version")
+        != specification.assumptions.assumption_set_version
+    ):
+        raise HistoricalStudyOutputError("Scenario provenance contract is invalid")
+    accounting_scenario = accounting_document.get("scenario")
+    if not isinstance(accounting_scenario, Mapping):
+        raise HistoricalStudyOutputError("Accounting scenario is invalid")
+    accounting_scenario = dict(accounting_scenario)
+    if (
+        accounting_scenario.pop("same_timestamp_event_order", None)
+        != [
+            "funding",
+            "fill",
+            "mark",
+        ]
+        or accounting_scenario != scenario_document
+    ):
+        raise HistoricalStudyOutputError("Accounting and scenario artifacts are inconsistent")
+    if (
+        accounting_document.get("schema_version") != 1
+        or accounting_document.get("study_type") != "deterministic_perpetual_accounting_simulation"
+        or metrics_document.get("schema_version") != PERFORMANCE_METRICS_SCHEMA_VERSION
+        or metrics_document.get("accounting_engine_version") != ACCOUNTING_ENGINE_VERSION
+    ):
+        raise HistoricalStudyOutputError("Accounting or metrics schema contract is invalid")
+    accounting_results = accounting_document.get("results")
+    metric_pnl = metrics_document.get("pnl_attribution")
+    if not isinstance(accounting_results, Mapping) or not isinstance(metric_pnl, Mapping):
+        raise HistoricalStudyOutputError("Accounting or metric P&L summary is invalid")
+    linked_values = {
+        "ending_equity": "ending_equity",
+        "fees": "fees",
+        "funding_cash_flow": "funding_cash_flow",
+        "initial_equity": "starting_equity",
+        "realized_price_pnl": "realized_price_pnl",
+        "slippage_cost_attribution": "slippage_attribution",
+        "total_pnl": "total_pnl",
+        "unrealized_price_pnl": "ending_unrealized_price_pnl",
+    }
+    if any(
+        accounting_results.get(accounting_name) != metric_pnl.get(metric_name)
+        for accounting_name, metric_name in linked_values.items()
+    ):
+        raise HistoricalStudyOutputError("Accounting and metrics P&L summaries are inconsistent")
+    components = bundle.manifest.get("components")
+    component_fields = {
+        "accounting_engine_version",
+        "assembly_schema_version",
+        "assumption_set_id",
+        "assumption_set_version",
+        "package",
+        "package_version",
+        "performance_metrics_schema_version",
+        "study_runner_version",
+    }
+    if not isinstance(components, Mapping) or set(components) != component_fields:
+        raise HistoricalStudyOutputError("Manifest component contract is invalid")
+    if (
+        components.get("package") != "wartosc-perp-research"
+        or not isinstance(components.get("package_version"), str)
+        or not components.get("package_version")
+        or components.get("study_runner_version") != HISTORICAL_STUDY_RUNNER_VERSION
+        or components.get("assembly_schema_version") != ASSEMBLY_SCHEMA_VERSION
+        or components.get("accounting_engine_version") != ACCOUNTING_ENGINE_VERSION
+        or components.get("performance_metrics_schema_version")
+        != PERFORMANCE_METRICS_SCHEMA_VERSION
+        or components.get("assumption_set_id") != specification.assumptions.assumption_set_id
+        or components.get("assumption_set_version")
+        != specification.assumptions.assumption_set_version
+    ):
+        raise HistoricalStudyOutputError("Manifest component values are invalid")
+    warnings = bundle.manifest.get("warning_summary")
+    if not isinstance(warnings, Mapping) or set(warnings) != {
+        "accounting_warning_count",
+        "availability",
+        "metric_warning_codes",
+    }:
+        raise HistoricalStudyOutputError("Manifest warning summary is invalid")
+    accounting_warnings = accounting_document.get("warnings")
+    metric_warnings = metrics_document.get("warnings")
+    if not isinstance(accounting_warnings, list) or not isinstance(metric_warnings, list):
+        raise HistoricalStudyOutputError("Artifact warning lists are invalid")
+    metric_warning_codes = [
+        item.get("code") for item in metric_warnings if isinstance(item, Mapping)
+    ]
+    if (
+        any(not isinstance(item, str) for item in accounting_warnings)
+        or len(metric_warning_codes) != len(metric_warnings)
+        or any(
+            not isinstance(item.get("code"), str)
+            or not isinstance(item.get("message"), str)
+            or set(item) != {"code", "message"}
+            for item in metric_warnings
+            if isinstance(item, Mapping)
+        )
+    ):
+        raise HistoricalStudyOutputError("Artifact warning contracts are invalid")
+    availability_paths = {
+        "annualization": ("annualization", "availability"),
+        "cagr": ("cagr", "availability"),
+        "cagr_to_max_drawdown": ("cagr_to_max_drawdown", "availability"),
+        "drawdown": ("drawdown", "availability"),
+        "normalized_turnover": ("turnover", "normalized_availability"),
+        "relative_drawdown": ("drawdown", "relative_availability"),
+        "returns": ("returns", "availability"),
+        "sampling": ("sampling", "availability"),
+        "sharpe_like": ("sharpe_like", "availability"),
+        "turnover": ("turnover", "availability"),
+    }
+    expected_availability: dict[str, object] = {}
+    for name, (section_name, availability_name) in availability_paths.items():
+        section = metrics_document.get(section_name)
+        availability = section.get(availability_name) if isinstance(section, Mapping) else None
+        expected_availability[name] = (
+            availability.get("status") if isinstance(availability, Mapping) else None
+        )
+    ending_position = metrics_document.get("ending_position")
+    is_open = ending_position.get("is_open") if isinstance(ending_position, Mapping) else None
+    if (
+        warnings.get("accounting_warning_count") != len(accounting_warnings)
+        or warnings.get("metric_warning_codes") != metric_warning_codes
+        or warnings.get("availability") != expected_availability
+        or not isinstance(ending_position, Mapping)
+        or not isinstance(is_open, bool)
+        or bundle.manifest.get("ending_position_status") != ("open" if is_open else "flat")
+    ):
+        raise HistoricalStudyOutputError("Manifest analytical summary is inconsistent")
 
 
 def _paths(output_directory: Path) -> HistoricalStudyPaths:
@@ -789,7 +1070,7 @@ def _validate_output_path(output_directory: Path) -> Path:
             "Filesystem root is not a valid study output directory"
         )
     for candidate in (output, *output.parents):
-        if candidate.is_symlink():
+        if _is_link_or_reparse(candidate):
             raise HistoricalStudyOutputPathError(
                 "Study output path must not contain symbolic links"
             )
@@ -801,7 +1082,7 @@ def _validate_output_path(output_directory: Path) -> Path:
         raise HistoricalStudyOutputPathError("Study output path exists and is not a directory")
     if output.exists():
         for child in output.iterdir():
-            if child.is_symlink():
+            if _is_link_or_reparse(child):
                 raise HistoricalStudyOutputPathError(
                     "Existing study output must not contain symbolic links"
                 )
@@ -819,7 +1100,9 @@ def _directory_matches(output: Path, bundle: HistoricalStudyArtifactBundle) -> b
     if entries != set(_ARTIFACT_NAMES):
         return False
     return all(
-        path.is_file() and not path.is_symlink() and path.read_bytes() == bundle.files[path.name]
+        path.is_file()
+        and not _is_link_or_reparse(path)
+        and path.read_bytes() == bundle.files[path.name]
         for path in output.iterdir()
     )
 
@@ -833,7 +1116,7 @@ def _read_existing_bundle(output: Path) -> HistoricalStudyArtifactBundle:
     files: dict[str, bytes] = {}
     for name in _ARTIFACT_NAMES:
         path = output / name
-        if not path.is_file() or path.is_symlink():
+        if not path.is_file() or _is_link_or_reparse(path):
             raise HistoricalStudyOutputPathError(
                 "Existing output is not a complete historical-study bundle; refusing overwrite"
             )
@@ -850,6 +1133,20 @@ def _read_existing_bundle(output: Path) -> HistoricalStudyArtifactBundle:
     return bundle
 
 
+def load_historical_study_bundle(
+    output_directory: Path,
+) -> HistoricalStudyArtifactBundle:
+    """Load and fully validate an existing canonical historical-study bundle."""
+
+    output = _validate_output_path(output_directory)
+    if not output.exists():
+        raise HistoricalStudyOutputPathError(f"Historical-study bundle does not exist: {output}")
+    try:
+        return _read_existing_bundle(output)
+    except HistoricalStudyOutputPathError as exc:
+        raise HistoricalStudyOutputError(str(exc)) from exc
+
+
 def _write_staged_bundle(stage: Path, bundle: HistoricalStudyArtifactBundle) -> None:
     for name in _ARTIFACT_NAMES:
         (stage / name).write_bytes(bundle.files[name])
@@ -862,7 +1159,7 @@ def _validate_staged_bundle(stage: Path, manifest: Mapping[str, Any]) -> None:
     staged_files = {
         name: (stage / name).read_bytes()
         for name in _ARTIFACT_NAMES
-        if (stage / name).is_file() and not (stage / name).is_symlink()
+        if (stage / name).is_file() and not _is_link_or_reparse(stage / name)
     }
     validate_historical_study_artifacts(
         HistoricalStudyArtifactBundle(files=staged_files, manifest=manifest)
@@ -878,7 +1175,11 @@ def _managed_sibling(output: Path, role: str) -> Path:
 
 def _remove_managed_directory(path: Path, output: Path, role: str) -> None:
     prefix = f".{output.name}.{role}-"
-    if path.parent != output.parent or not path.name.startswith(prefix) or path.is_symlink():
+    if (
+        path.parent != output.parent
+        or not path.name.startswith(prefix)
+        or _is_link_or_reparse(path)
+    ):
         raise HistoricalStudyOutputError("Refusing to remove an unmanaged study transaction path")
     if path.exists():
         if not path.is_dir():

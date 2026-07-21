@@ -116,6 +116,10 @@ jobs:
         run: |
           work/core-venv/bin/python tests/installed_study_smoke.py work/installed-study-smoke
 
+      - name: Run installed research-session CLI vertical
+        run: |
+          work/core-venv/bin/python tests/installed_research_session_smoke.py work/installed-session-smoke
+
       - name: Verify archive-enabled wheel installation and real LZ4 parsing
         run: |
           WHEEL=$(find dist -name '*.whl' -print -quit)

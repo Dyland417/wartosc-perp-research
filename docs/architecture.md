@@ -389,13 +389,38 @@ P&L, returns, drawdown, turnover, and exposure; scenario and direct-metrics resu
 identical semantic databases and repeated runs are byte-identical; every manifest hash verifies;
 and failures cannot expose a partial complete-looking bundle.
 
-### Phase 4C - Basis and microstructure
+### Phase 5 - Research-tool and immutable-session boundary (checkpoint 1)
+
+- A closed catalog exposes only the mature deterministic historical-study run and bundle verifier.
+- Strict request/result envelopes reject unknown fields, binary floats, non-finite numbers,
+  unsupported versions, unsafe paths, and unregistered capabilities.
+- The dispatcher calls application-layer Python functions directly; no dynamic imports, CLI
+  recursion, arbitrary SQL, shell, Python, filesystem browsing, or unrestricted network tool is
+  available.
+- Artifact-backed sessions store bounded structured evidence in atomic append-only event segments.
+- A full hash chain detects persisted mutation, deletion, reorder, causal-reference corruption,
+  and partial files; a committed-head document also detects tail deletion, while a separate
+  clock-free analytical chain supports deterministic portable export.
+- Identical requests against identical resolved source bytes are idempotent. Changed source bytes
+  create a new attempt and never overwrite earlier evidence silently.
+- SQLite runs hold a reserved writer barrier from source hashing through all analytical reads, so
+  the recorded identity and consumed records cannot diverge under cooperative access.
+- Filesystem writers are deliberately single-writer and fail closed on locks, changed lock
+  ownership, stale heads, or a promoted segment whose head commit did not complete.
+- Research sessions store no credentials, hidden reasoning, raw databases, or autonomous chat
+  transcripts.
+- There is no LLM dependency and no autonomous Research Agent in this checkpoint.
+
+See `docs/research-tools-and-sessions.md` for schemas, failure categories, trust boundaries, and
+the lifecycle intended for future Funding and Market agents.
+
+### Later phase - Basis and microstructure
 
 Add spot and dated-futures references, trades, liquidations, and validated order-book ingestion. Research basis decomposition, depth, imbalance, spread, impact, latency, and capacity. Move high-frequency tables to partitioned PostgreSQL or columnar files only when measured volume justifies it.
 
 Exit criterion: candidate opportunities include executable size, synchronized timestamps, fees, slippage, and venue constraints.
 
-### Phase 5 — Strategy and full backtest framework
+### Later phase - Strategy and full backtest framework
 
 Build point-in-time signal scheduling and data-to-event adapters on the Phase 4B ledger. Add
 commission schedules, latency, partial fills, margin, leverage limits, liquidation, and capital
@@ -403,7 +428,7 @@ allocation. Strategies remain pure and execution-independent.
 
 Exit criterion: deterministic backtests prevent look-ahead, include realistic costs, expose capacity, and pass accounting invariants.
 
-### Phase 6 — Continuous research operations
+### Later phase - Continuous research operations
 
 Add scheduled collection, observability, dataset manifests, automated quality reports, notebook/report execution, experiment tracking, and disaster recovery. Execution infrastructure remains a separate later project with an explicit safety review.
 
