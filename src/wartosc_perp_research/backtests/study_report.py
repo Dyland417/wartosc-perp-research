@@ -71,7 +71,7 @@ _ARTIFACT_DEPENDENCIES = {
 def _is_link_or_reparse(path: Path) -> bool:
     try:
         metadata = os.lstat(path)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     attributes = getattr(metadata, "st_file_attributes", 0)

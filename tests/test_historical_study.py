@@ -743,16 +743,22 @@ def test_overwrite_faults_restore_the_exact_prior_bundle_without_privileged_syml
     assert not list(tmp_path.glob(".study.rollback-*"))
 
 
+def test_output_non_directory_ancestor_is_rejected(tmp_path: Path) -> None:
+    database_path = tmp_path / "research.db"
+    _seed_database(database_path)
+    result = _run(database_path)
+    parent_file = tmp_path / "not-a-directory"
+    parent_file.write_text("fixture", encoding="utf-8")
+    with pytest.raises(HistoricalStudyOutputError, match="ancestor"):
+        write_historical_study_bundle(result, parent_file / "study")
+
+
 def test_output_symlinks_and_root_are_rejected(tmp_path: Path) -> None:
     database_path = tmp_path / "research.db"
     _seed_database(database_path)
     result = _run(database_path)
     with pytest.raises(HistoricalStudyOutputError, match="Filesystem root"):
         write_historical_study_bundle(result, Path(tmp_path.anchor))
-    parent_file = tmp_path / "not-a-directory"
-    parent_file.write_text("fixture", encoding="utf-8")
-    with pytest.raises(HistoricalStudyOutputError, match="ancestor"):
-        write_historical_study_bundle(result, parent_file / "study")
 
     target = tmp_path / "target"
     target.mkdir()

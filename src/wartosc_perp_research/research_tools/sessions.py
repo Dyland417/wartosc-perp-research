@@ -76,7 +76,7 @@ _EVENT_TYPES = {
 def _is_link_or_reparse(path: Path) -> bool:
     try:
         metadata = os.lstat(path)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     attributes = getattr(metadata, "st_file_attributes", 0)
@@ -233,6 +233,8 @@ def _safe_path(path: Path, *, must_exist: bool, kind: str) -> Path:
     for candidate in (resolved, *resolved.parents):
         if _is_link_or_reparse(candidate):
             raise ResearchSessionPathError(f"{kind.capitalize()} path must not contain symlinks")
+        if candidate != resolved and candidate.exists() and not candidate.is_dir():
+            raise ResearchSessionPathError(f"{kind.capitalize()} path ancestor is not a directory")
     if must_exist and (not resolved.exists() or not resolved.is_dir()):
         raise ResearchSessionPathError(f"{kind.capitalize()} directory does not exist")
     if resolved.exists() and not resolved.is_dir():
@@ -247,6 +249,8 @@ def _safe_input_file(path: Path, context: str) -> Path:
     for candidate in (resolved, *resolved.parents):
         if _is_link_or_reparse(candidate):
             raise ResearchSessionPathError(f"{context} path must not contain symlinks")
+        if candidate != resolved and candidate.exists() and not candidate.is_dir():
+            raise ResearchSessionPathError(f"{context} path ancestor is not a directory")
     if not resolved.exists() or not resolved.is_file():
         raise ResearchSessionPathError(f"{context} is not an existing regular file")
     return resolved
@@ -1130,6 +1134,8 @@ def export_research_session(path: Path, output_path: Path) -> tuple[Path, str]:
     for candidate in (output, *output.parents):
         if _is_link_or_reparse(candidate):
             raise ResearchSessionPathError("Export path must not contain symlinks")
+        if candidate != output and candidate.exists() and not candidate.is_dir():
+            raise ResearchSessionPathError("Export path ancestor is not a directory")
     if output.exists() and (not output.is_file() or _is_link_or_reparse(output)):
         raise ResearchSessionPathError("Export target is not a regular file")
     content = canonical_json_bytes(portable_session_document(snapshot))

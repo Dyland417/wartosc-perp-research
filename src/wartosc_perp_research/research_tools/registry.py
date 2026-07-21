@@ -56,7 +56,7 @@ _STUDY_LIMITATIONS = (
 def _is_link_or_reparse(path: Path) -> bool:
     try:
         metadata = os.lstat(path)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     attributes = getattr(metadata, "st_file_attributes", 0)
@@ -160,6 +160,8 @@ class ToolExecutionContext:
                 break
             if _is_link_or_reparse(candidate):
                 raise SafeToolPathError(f"'{field_name}' must not contain symbolic links")
+            if candidate != path and candidate.exists() and not candidate.is_dir():
+                raise SafeToolPathError(f"'{field_name}' ancestor is not a directory")
         if any(
             path == item or item in path.parents or path in item.parents
             for item in self.reserved_paths

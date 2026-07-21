@@ -568,6 +568,25 @@ def test_symlink_input_is_rejected_when_supported(research_root: Path) -> None:
         context.resolve("linked.json", "specification", kind="file")
 
 
+def test_non_directory_path_ancestors_are_rejected(research_root: Path) -> None:
+    blocker = research_root / "not-a-directory"
+    blocker.write_text("fixture", encoding="utf-8")
+    context = ToolExecutionContext(research_root)
+
+    with pytest.raises(SafeToolPathError, match="ancestor"):
+        context.resolve("not-a-directory/output", "output", kind="output")
+    with pytest.raises(ResearchSessionPathError, match="ancestor"):
+        create_research_session(
+            ResearchSessionSpecification("blocked", "Reject an unsafe ancestor.", {}),
+            blocker / "session",
+            clock=CLOCK,
+        )
+
+    session = _session(research_root)
+    with pytest.raises(ResearchSessionPathError, match="ancestor"):
+        export_research_session(session, blocker / "export.json")
+
+
 def test_failed_tool_execution_is_recorded_without_corrupting_session(
     research_root: Path,
 ) -> None:
