@@ -6,6 +6,7 @@ from decimal import ROUND_DOWN, Decimal, getcontext, localcontext
 
 import pytest
 
+import wartosc_perp_research.backtests.metrics as metrics_module
 from wartosc_perp_research.backtests import (
     BacktestScenario,
     FillEvent,
@@ -1324,6 +1325,80 @@ def test_global_decimal_context_is_unchanged_when_curve_construction_raises() ->
         with pytest.raises(ValueError, match="Duplicate or conflicting"):
             build_valuation_equity_curve(result)
         after = getcontext().copy()
+        assert (after.prec, after.rounding, after.flags, after.traps) == (
+            before.prec,
+            before.rounding,
+            before.flags,
+            before.traps,
+        )
+    finally:
+        getcontext().prec = original.prec
+        getcontext().rounding = original.rounding
+        getcontext().Emin = original.Emin
+        getcontext().Emax = original.Emax
+        getcontext().capitals = original.capitals
+        getcontext().clamp = original.clamp
+        getcontext().clear_flags()
+        for signal, enabled in original.traps.items():
+            getcontext().traps[signal] = enabled
+
+
+def test_multi_period_recurring_returns_reconcile_at_controlled_precision() -> None:
+    metrics = _metrics_for_equities(
+        ["100", "101", "103", "107"],
+        [0, 3_600, 7_200, 10_800],
+        interval_seconds=3_600,
+        periods_per_year=8_760,
+    )
+
+    assert metrics.returns.availability.status is MetricStatus.AVAILABLE
+    assert metrics.returns.equity_reconciled
+    assert metrics.returns.cumulative_return == Decimal("0.07")
+
+    values = tuple(
+        sample.valuation.equity
+        for sample in metrics.sampling.samples
+        if sample.valuation is not None
+    )
+    reconciled, observed_error, maximum_error = metrics_module._periodic_return_reconciliation(
+        values,
+        metrics.returns.returns,
+    )
+    assert reconciled
+    assert observed_error > 0
+    assert observed_error <= maximum_error
+
+
+def test_return_reconciliation_rejects_one_stored_ulp_corruption_and_preserves_context() -> None:
+    metrics = _metrics_for_equities(
+        ["100", "101", "103", "107"],
+        [0, 3_600, 7_200, 10_800],
+        interval_seconds=3_600,
+        periods_per_year=8_760,
+    )
+    values = tuple(
+        sample.valuation.equity
+        for sample in metrics.sampling.samples
+        if sample.valuation is not None
+    )
+    last = metrics.returns.returns[-1]
+    one_stored_ulp = Decimal(1).scaleb(last.value.as_tuple().exponent)
+    with localcontext() as context:
+        context.prec = 80
+        corrupted = (
+            *metrics.returns.returns[:-1],
+            replace(last, value=last.value + one_stored_ulp),
+        )
+
+    original = getcontext().copy()
+    try:
+        getcontext().prec = 17
+        getcontext().rounding = ROUND_DOWN
+        getcontext().clear_flags()
+        before = getcontext().copy()
+        reconciled, _, _ = metrics_module._periodic_return_reconciliation(values, corrupted)
+        after = getcontext().copy()
+        assert not reconciled
         assert (after.prec, after.rounding, after.flags, after.traps) == (
             before.prec,
             before.rounding,

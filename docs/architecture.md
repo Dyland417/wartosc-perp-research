@@ -325,6 +325,10 @@ right-continuous event-time position duration and valuation-observed notional ex
 separately typed. Invalid contracts raise; insufficient
 valid data produces absent values with status, reason code, and detail rather than a numeric
 sentinel. Slippage remains attribution only, and engine P&L identities must reconcile exactly.
+Periodic-return reconciliation retains each 80-digit point return unchanged and uses an exact
+rational product-error envelope derived from the half-ULP bounds of each declared Decimal division
+and subtraction. The direct ending/starting equity ratio remains the cumulative-return authority;
+there is no arbitrary numerical tolerance.
 
 This checkpoint emits no files and adds no CLI. See `docs/performance-metrics.md` for formulas and
 limitations. Candle-close bias, unobserved intrabar drawdowns, sampling-sensitive annualization,
@@ -334,6 +338,56 @@ portfolio risk, margin, and liquidation are prominent warnings.
 Exit criterion: complete hand-calculated fixtures reconcile curves, returns, drawdown, turnover,
 exposure, Sharpe-like, CAGR, and CAGR-to-max-drawdown; incomplete and insolvent cases fail closed;
 same inputs produce equal typed results; and the caller's Decimal context remains unchanged.
+
+### Phase 4B - Historical-study runner and reporting (checkpoint 4B)
+
+The historical-study service is a composition boundary rather than a second analytical engine. A
+strict versioned study specification embeds the checkpoint-3 position schedule and execution
+assumptions and adds the checkpoint-4A valuation-sampling and metric specifications. The database
+path and output location remain operational CLI concerns. Strategy code, Python expressions,
+external cash flows, and machine paths have no place in the portable contract.
+
+The application flow is fixed:
+
+```text
+strict study specification
+        |
+        v
+curated database repository -> scenario assembler -> accounting engine -> metrics kernel
+                                                                  |
+                                                                  v
+                                           deterministic artifact bundle
+```
+
+No downstream stage recalculates an upstream value. A source selection, scenario, accounting, or
+provenance failure is hard and leaves no promoted output. Insufficient observations, zero return
+volatility, zero drawdown, nonpositive equity, short duration, or a valid open terminal position
+remain typed analytical availability states inside a valid bundle.
+
+The bundle separates portable study identity, analytical identity, source lineage, and operational
+retrieval history. Descriptive IDs, labels, notes, and metadata affect normalized portable content
+but are removed from the economic analytical-identity document. SQLite row IDs, insertion order,
+and receipt/ingestion/retrieval clocks never enter portable artifacts. Immutable source-object and
+source-row evidence contributes to the separate source-lineage hash. Every artifact except the
+manifest is SHA-256 hashed by the manifest, avoiding self-reference.
+
+Output is staged and validated in a sibling directory, then promoted at the directory boundary.
+New-directory promotion is a same-filesystem rename. Replacing an existing nonempty directory uses
+a same-parent backup, promotion, and rollback sequence for Windows compatibility. Promotion or
+backup-cleanup failure restores the exact prior bundle. Only an already validated study bundle is
+eligible for overwrite, and managed sibling paths are containment-checked before cleanup; a power
+loss between rename operations is the remaining platform limitation. Identical reruns perform no
+write, and different output requires explicit overwrite authorization.
+
+The narrow CLI is `wpr backtest study --database ... --spec ... --output ...`. A future Backtest
+Agent may generate or select an external target schedule and invoke this command as a deterministic
+tool, but it must not bypass the strict specification, infer hidden assumptions, or reinterpret the
+artifacts as evidence of live profitability. See `docs/historical-study.md`.
+
+Exit criterion: a synthetic database-to-bundle fixture reconciles fills, funding, fees, slippage,
+P&L, returns, drawdown, turnover, and exposure; scenario and direct-metrics results round-trip;
+identical semantic databases and repeated runs are byte-identical; every manifest hash verifies;
+and failures cannot expose a partial complete-looking bundle.
 
 ### Phase 4C - Basis and microstructure
 

@@ -112,6 +112,10 @@ jobs:
                   raise AssertionError("missing optional dependency was not actionable")
           PY
 
+      - name: Run installed historical-study CLI vertical
+        run: |
+          work/core-venv/bin/python tests/installed_study_smoke.py work/installed-study-smoke
+
       - name: Verify archive-enabled wheel installation and real LZ4 parsing
         run: |
           WHEEL=$(find dist -name '*.whl' -print -quit)

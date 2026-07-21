@@ -387,8 +387,11 @@ def execution_assumptions_to_dict(assumptions: ExecutionAssumptions) -> dict[str
     }
 
 
-def load_position_schedule(path: Path) -> PositionSchedule:
-    data = _json_object(path, "Position schedule")
+def position_schedule_from_dict(data: Mapping[str, Any]) -> PositionSchedule:
+    """Build a schedule from an already parsed strict JSON object."""
+
+    if not isinstance(data, Mapping) or not all(isinstance(key, str) for key in data):
+        raise TypeError("Position schedule must be a JSON object")
     allowed = {
         "schema_version",
         "schedule_id",
@@ -451,8 +454,15 @@ def load_position_schedule(path: Path) -> PositionSchedule:
     )
 
 
-def load_execution_assumptions(path: Path) -> ExecutionAssumptions:
-    data = _json_object(path, "Execution assumptions")
+def load_position_schedule(path: Path) -> PositionSchedule:
+    return position_schedule_from_dict(_json_object(path, "Position schedule"))
+
+
+def execution_assumptions_from_dict(data: Mapping[str, Any]) -> ExecutionAssumptions:
+    """Build execution assumptions from an already parsed strict JSON object."""
+
+    if not isinstance(data, Mapping) or not all(isinstance(key, str) for key in data):
+        raise TypeError("Execution assumptions must be a JSON object")
     allowed = {
         "schema_version",
         "assumption_set_id",
@@ -502,6 +512,10 @@ def load_execution_assumptions(path: Path) -> ExecutionAssumptions:
         ),
         missing_data_policy=data["missing_data_policy"],
     )
+
+
+def load_execution_assumptions(path: Path) -> ExecutionAssumptions:
+    return execution_assumptions_from_dict(_json_object(path, "Execution assumptions"))
 
 
 @dataclass(frozen=True, slots=True)

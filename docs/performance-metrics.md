@@ -91,10 +91,23 @@ r_t = equity_t / equity_(t-1) - 1
 ```
 
 At least two equity observations are required. A zero or negative equity value makes returns
-unavailable, preventing a fabricated post-insolvency return. The product of `(1 + r_t)` must
-reconcile exactly to ending sampled equity divided by starting sampled equity. Log returns are not
-implemented. External deposits and withdrawals are not supported by the accounting scenario; these
-return calculations must not be used if such cash flows exist outside the supplied result.
+unavailable, preventing a fabricated post-insolvency return. Every stored point return must equal
+the stated division/subtraction at 80-digit, round-half-even precision exactly. Reconciliation then
+uses exact rational arithmetic rather than an arbitrary absolute or relative tolerance. For factor
+`f_i = 1 + r_i`, its maximum representation error `e_i` is the sum of the round-to-nearest half-ULP
+bounds for the 80-digit equity division and return subtraction. The compounded error bound is:
+
+```text
+maximum error = product(abs(f_i) + e_i) - product(abs(f_i))
+```
+
+The exact rational difference between the product of stored factors and exact ending/starting
+equity must not exceed this bound. This admits only error mathematically attributable to the declared
+Decimal operations; changing even one stored last-place unit fails the exact point-return check. The
+direct 80-digit ending/starting equity ratio remains authoritative for cumulative return, and every
+reported point-to-point return is unchanged. Log returns are not implemented. External deposits and
+withdrawals are not supported by the accounting scenario; these return calculations must not be
+used if such cash flows exist outside the supplied result.
 
 ### P&L attribution
 

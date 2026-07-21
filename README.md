@@ -37,7 +37,9 @@ not generate strategies or claim candle-based fills were executable. Checkpoint 
 Decimal performance-metrics kernel with audit and valuation curves, strict as-of sampling, P&L
 attribution, drawdown, coherent annualization, simple-return Sharpe-like, CAGR, turnover, event-time
 position duration, and valuation-observed notional exposure. Flat terminal accounting equity is
-retained without inventing a market price.
+retained without inventing a market price. Checkpoint 4B composes the database adapter, accounting
+engine, and metrics kernel into one offline historical-study command that emits a deterministic,
+transactional, provenance-hashed research bundle without duplicating any financial calculation.
 
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
@@ -72,6 +74,8 @@ See [docs/scenario-assembly.md](docs/scenario-assembly.md) for the checkpoint-3 
 look-ahead policy, boundary semantics, and failure rules.
 See [docs/performance-metrics.md](docs/performance-metrics.md) for checkpoint-4A formulas,
 sampling rules, availability semantics, and interpretation limits.
+See [docs/historical-study.md](docs/historical-study.md) for checkpoint-4B study specifications,
+artifact contracts, failure semantics, and deterministic output rules.
 
 ## Repository layout
 
@@ -94,6 +98,8 @@ src/wartosc_perp_research/
   backtests/scenario.py                 strict versioned JSON scenario loading
   backtests/report.py                   deterministic simulation reports and manifests
   backtests/metrics.py                  pure Decimal curves and performance calculations
+  backtests/study.py                    strict study contract and component orchestration
+  backtests/study_report.py             deterministic bundle serialization and promotion
   resources/exchanges.yaml             packaged non-secret defaults
   storage/database.py                  engine and transaction lifecycle
   storage/models.py                    relational schema
@@ -455,6 +461,45 @@ Generated artifacts contain no report-generation clock and are byte-identical fo
 inputs. See
 [the scenario assembly specification](docs/scenario-assembly.md) for the complete contracts and
 look-ahead rules.
+
+## Deterministic historical studies
+
+Run the complete offline research pipeline from an existing curated database:
+
+```text
+wpr backtest study \
+  --database work/research.db \
+  --spec historical-study.json \
+  --output outputs/historical-study
+```
+
+The schema-v1 study document embeds one existing position schedule and execution-assumption set,
+plus an inclusive regular valuation grid, exact maximum valuation age, periods per year, seconds
+per year, annual risk-free rate, and sample-standard-deviation convention. Decimal financial values
+must be quoted strings and timestamps must use UTC. Database and output paths are CLI inputs, never
+portable study content. Optional descriptive metadata changes the normalized study-document hash
+but is excluded from the separate analytical-identity hash; study, schedule, assumption, and intent
+labels and notes are likewise excluded from analytical identity.
+
+The runner calls the existing database repository, scenario assembler, accounting engine, and
+performance-metrics kernel directly. It writes `study.json`, `scenario.json`, `assembly.json`,
+`accounting.json`, `metrics.json`, three equity-curve CSVs, `report.md`, and `manifest.json`.
+Portable artifacts exclude SQLite IDs and operational receipt, ingestion, and retrieval clocks.
+The manifest records source lineage separately, hashes every other artifact, and carries explicit
+component versions and dependency relationships.
+
+Bundle creation is transactional at the directory boundary: all files are created and validated in
+a sibling staging directory before promotion. An identical rerun is a no-op. A different existing
+validated bundle requires `--overwrite`; arbitrary, incomplete, or hash-invalid directories,
+symbolic-link paths, and filesystem roots are rejected. On Windows, replacement uses a same-parent
+backup-and-promote sequence with rollback because replacing a nonempty directory is not a single
+atomic operating-system operation. Promotion or backup-cleanup failure restores the prior bundle.
+
+Exit `0` means a valid complete bundle, even when a metric is explicitly unavailable. Exit `1`
+means a source-data, accounting, provenance, integrity, or runtime failure. Exit `2` means an
+invalid specification/request or unsafe/conflicting output path. A hard failure never promotes a
+partial study directory. See [the historical-study contract](docs/historical-study.md) for the
+complete schema and artifact meanings.
 
 ## Funding research workflow
 

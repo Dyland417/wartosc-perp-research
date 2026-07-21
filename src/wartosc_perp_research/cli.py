@@ -14,15 +14,20 @@ from typing import Any
 
 from wartosc_perp_research.backtests import (
     BacktestOutputError,
+    HistoricalStudyOutputPathError,
+    HistoricalStudySpecificationError,
     ScenarioAssemblyError,
     ScenarioAssemblyOutputError,
     assemble_scenario_from_database,
     backtest_result_to_dict,
     load_backtest_scenario,
     load_execution_assumptions,
+    load_historical_study_specification,
     load_position_schedule,
     run_backtest,
+    run_historical_study,
     write_backtest_report,
+    write_historical_study_bundle,
     write_scenario_assembly,
 )
 from wartosc_perp_research.collectors import TimeRange
@@ -237,6 +242,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Replace existing assembly files when their contents differ",
+    )
+    backtest_study = backtest_commands.add_parser(
+        "study", help="Run a deterministic database-backed historical study"
+    )
+    backtest_study.add_argument("--database", type=Path, required=True)
+    backtest_study.add_argument("--spec", type=Path, required=True)
+    backtest_study.add_argument("--output", type=Path, required=True)
+    backtest_study.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing different complete study bundle",
     )
     return parser
 
@@ -767,15 +783,49 @@ def _run_backtest_assemble(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _run_backtest_study(args: argparse.Namespace) -> dict[str, Any]:
+    database: Database | None = None
+    try:
+        specification = load_historical_study_specification(args.spec)
+        database = _database_from_file(args.database)
+    except (HistoricalStudySpecificationError, TypeError, ValueError) as exc:
+        raise ResearchRequestError(str(exc)) from exc
+    try:
+        result = run_historical_study(database, specification)
+        try:
+            paths = write_historical_study_bundle(
+                result,
+                args.output,
+                overwrite=args.overwrite,
+            )
+        except HistoricalStudyOutputPathError as exc:
+            raise ResearchRequestError(str(exc)) from exc
+    finally:
+        database.dispose()
+    return {
+        "status": "complete",
+        "study_type": "deterministic_single_instrument_historical_study",
+        "study_id": specification.study_id,
+        "exchange": specification.schedule.exchange,
+        "symbol": specification.schedule.instrument,
+        "ending_position_status": ("open" if result.metrics.ending_position.is_open else "flat"),
+        "ending_equity": str(result.accounting.ending_equity),
+        "scenario_sha256": result.assembly.hashes["scenario_sha256"],
+        "manifest_json": str(paths.manifest_json),
+        "report_markdown": str(paths.report_markdown),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "backtest":
-            output: dict[str, Any] = (
-                _run_backtest_assemble(args)
-                if args.backtest_command == "assemble"
-                else _run_backtest_scenario(args)
-            )
+            if args.backtest_command == "assemble":
+                output: dict[str, Any] = _run_backtest_assemble(args)
+            elif args.backtest_command == "study":
+                output = _run_backtest_study(args)
+            else:
+                output = _run_backtest_scenario(args)
         else:
             settings = load_settings(args.config)
             if args.command == "db":

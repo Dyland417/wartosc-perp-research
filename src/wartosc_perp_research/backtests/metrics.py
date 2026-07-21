@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, InvalidOperation, localcontext
 from enum import StrEnum
+from fractions import Fraction
 
 from .engine import (
     ACCOUNTING_ENGINE_VERSION,
@@ -153,6 +154,81 @@ def _decimal_power(base: Decimal, exponent: Decimal) -> Decimal:
         if exponent == exponent.to_integral_value():
             return context.power(base, int(exponent))
         return context.exp(context.ln(base) * exponent)
+
+
+def _fraction_adjusted(value: Fraction) -> int:
+    """Return floor(log10(abs(value))) using exact integer arithmetic."""
+
+    if value == 0:
+        raise ValueError("Zero has no adjusted decimal exponent")
+    numerator = abs(value.numerator)
+    denominator = value.denominator
+    adjusted = len(str(numerator)) - len(str(denominator))
+    if adjusted >= 0:
+        if numerator < denominator * 10**adjusted:
+            adjusted -= 1
+    elif numerator * 10 ** (-adjusted) < denominator:
+        adjusted -= 1
+    return adjusted
+
+
+def _half_ulp_bound(value: Fraction, precision: int) -> Fraction:
+    """Return the round-to-nearest half-ULP bound at ``precision`` significant digits."""
+
+    if value == 0:
+        return Fraction(0)
+    exponent = _fraction_adjusted(value) - precision
+    if exponent >= 0:
+        return Fraction(5 * 10**exponent)
+    return Fraction(5, 10 ** (-exponent))
+
+
+def _periodic_return_reconciliation(
+    values: tuple[Decimal, ...],
+    returns: tuple[PeriodicReturn, ...],
+) -> tuple[bool, Fraction, Fraction]:
+    """Reconcile stored returns with an exact bound for their Decimal rounding steps.
+
+    Each point return is first required to equal the unchanged 80-digit division/subtraction
+    result.  For factor ``i``, the error against the exact equity ratio is bounded by the sum of
+    the half-ULP bounds for that division and subtraction.  Exact rational arithmetic then applies
+    the product bound ``prod(abs(f_i) + e_i) - prod(abs(f_i))``.
+    """
+
+    if len(values) != len(returns) + 1:
+        return False, Fraction(0), Fraction(0)
+    factors: list[Fraction] = []
+    factor_bounds: list[Fraction] = []
+    with localcontext() as context:
+        context.prec = PERFORMANCE_DECIMAL_PRECISION
+        context.rounding = ROUND_HALF_EVEN
+        for previous, current, item in zip(values[:-1], values[1:], returns, strict=True):
+            rounded_ratio = current / previous
+            expected_return = rounded_ratio - Decimal("1")
+            if item.value != expected_return:
+                return False, Fraction(0), Fraction(0)
+            exact_ratio = Fraction(current) / Fraction(previous)
+            rounded_ratio_fraction = Fraction(rounded_ratio)
+            exact_subtraction = rounded_ratio_fraction - Fraction(1)
+            division_bound = _half_ulp_bound(exact_ratio, PERFORMANCE_DECIMAL_PRECISION)
+            subtraction_bound = _half_ulp_bound(
+                exact_subtraction,
+                PERFORMANCE_DECIMAL_PRECISION,
+            )
+            factors.append(Fraction(1) + Fraction(item.value))
+            factor_bounds.append(division_bound + subtraction_bound)
+
+    compounded = Fraction(1)
+    bound_product = Fraction(1)
+    absolute_factor_product = Fraction(1)
+    for factor, bound in zip(factors, factor_bounds, strict=True):
+        compounded *= factor
+        absolute_factor_product *= abs(factor)
+        bound_product *= abs(factor) + bound
+    exact_ratio = Fraction(values[-1]) / Fraction(values[0])
+    observed_error = abs(compounded - exact_ratio)
+    maximum_error = bound_product - absolute_factor_product
+    return observed_error <= maximum_error, observed_error, maximum_error
 
 
 def _event_identity(event_type: str, event_time: datetime, sequence: int) -> str:
@@ -889,10 +965,7 @@ def calculate_periodic_returns(sampling: ValuationSamplingResult) -> ReturnStati
             len(returns)
         )
         cumulative_return = values[-1] / values[0] - Decimal("1")
-        compounded = Decimal("1")
-        for item in returns:
-            compounded *= Decimal("1") + item.value
-        equity_reconciled = compounded == values[-1] / values[0]
+        equity_reconciled, _, _ = _periodic_return_reconciliation(tuple(values), returns)
     if not equity_reconciled:  # pragma: no cover - exact arithmetic invariant
         raise AssertionError("Periodic returns do not reconcile sampled equity levels")
     return ReturnStatistics(
