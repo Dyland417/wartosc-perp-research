@@ -19,6 +19,7 @@ from uuid import uuid4
 from .contracts import (
     ArtifactReference,
     ToolContractError,
+    ToolExecutionStatus,
     ToolRequest,
     ToolResult,
     canonical_json_bytes,
@@ -182,15 +183,19 @@ class SessionInvocationReceipt:
     idempotent_retry: bool
     appended_event_count: int
     analytical_head_sha256: str
+    output_reused: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "analytical_head_sha256": self.analytical_head_sha256,
             "appended_event_count": self.appended_event_count,
             "attempt": self.attempt,
             "idempotent_retry": self.idempotent_retry,
             "result": self.result.to_dict(),
         }
+        if self.output_reused is not None:
+            value["output_reused"] = self.output_reused
+        return value
 
 
 def _researcher_text(value: object, field_name: str, *, maximum: int = 8_192) -> str:
@@ -513,6 +518,133 @@ def _validate_event_payload(event: Mapping[str, Any]) -> None:
             raise ResearchSessionIntegrityError("Tool event attempt must be a positive integer")
 
 
+def _verify_tool_lifecycles(events: Sequence[Mapping[str, Any]]) -> None:
+    """Require every recorded tool attempt to use one canonical, complete event lifecycle."""
+
+    next_attempt_by_request: dict[str, int] = {}
+    index = 0
+    while index < len(events):
+        event = events[index]
+        event_type = event["event_type"]
+        if event_type == "session_created":
+            if index != 0:
+                raise ResearchSessionIntegrityError(
+                    "Session-created event is only valid as the first session event"
+                )
+            index += 1
+            continue
+        if event_type in _RESEARCHER_EVENT_TYPES.values():
+            index += 1
+            continue
+        if event_type != "validated_tool_request":
+            raise ResearchSessionIntegrityError(
+                f"Orphaned or out-of-order tool event: {event_type}"
+            )
+
+        analytical = event["analytical"]
+        request = ToolRequest.from_dict(analytical["request"])
+        request_identity = analytical["request_identity_sha256"]
+        attempt = analytical["attempt"]
+        if request_identity != canonical_sha256(request.to_dict()):
+            raise ResearchSessionIntegrityError(
+                "Validated tool request identity does not match its canonical request"
+            )
+        expected_attempt = next_attempt_by_request.get(request_identity, 1)
+        if attempt != expected_attempt:
+            raise ResearchSessionIntegrityError(
+                "Tool attempts must be unique and consecutive for each request identity"
+            )
+        next_attempt_by_request[request_identity] = expected_attempt + 1
+        if event["parent_analytical_event_sha256"] != [event["previous_analytical_event_sha256"]]:
+            raise ResearchSessionIntegrityError(
+                "Validated tool request must descend from the pre-invocation session head"
+            )
+
+        def required_event(
+            offset: int,
+            expected_type: str,
+            *,
+            start: int = index,
+            predecessor: str = event_type,
+        ) -> Mapping[str, Any]:
+            position = start + offset
+            if position >= len(events) or events[position]["event_type"] != expected_type:
+                raise ResearchSessionIntegrityError(
+                    f"Tool lifecycle requires {expected_type} immediately after {predecessor}"
+                )
+            return events[position]
+
+        resolved_event = required_event(1, "resolved_input_identity")
+        resolved = resolved_event["analytical"]
+        if (
+            resolved["attempt"] != attempt
+            or resolved["request_identity_sha256"] != request_identity
+            or resolved_event["parent_analytical_event_sha256"]
+            != [event["analytical_event_sha256"]]
+        ):
+            raise ResearchSessionIntegrityError(
+                "Resolved-input event is not bound to its validated request"
+            )
+
+        result_event = required_event(2, "tool_execution_result")
+        result = ToolResult.from_dict(result_event["analytical"]["result"])
+        if (
+            result_event["analytical"]["attempt"] != attempt
+            or result_event["parent_analytical_event_sha256"]
+            != [resolved_event["analytical_event_sha256"]]
+            or result.tool_name != request.tool_name
+            or result.tool_schema_version != request.schema_version
+            or result.request_identity_sha256 != request_identity
+            or result.resolved_input_identity_sha256 != resolved["resolved_input_identity_sha256"]
+            or [item.to_dict() for item in result.input_artifacts] != resolved["input_artifacts"]
+        ):
+            raise ResearchSessionIntegrityError(
+                "Tool result is not bound to its request and resolved inputs"
+            )
+
+        offset = 3
+        if result.output_artifacts:
+            output_event = required_event(offset, "output_artifact_references")
+            if (
+                output_event["analytical"]["attempt"] != attempt
+                or output_event["analytical"]["artifacts"]
+                != [item.to_dict() for item in result.output_artifacts]
+                or output_event["parent_analytical_event_sha256"]
+                != [result_event["analytical_event_sha256"]]
+            ):
+                raise ResearchSessionIntegrityError(
+                    "Output-artifact event does not match its tool result"
+                )
+            offset += 1
+
+        for warning in result.warnings:
+            warning_event = required_event(offset, "tool_warning")
+            if warning_event["analytical"] != {
+                "attempt": attempt,
+                "detail": warning.to_dict(),
+            } or warning_event["parent_analytical_event_sha256"] != [
+                result_event["analytical_event_sha256"]
+            ]:
+                raise ResearchSessionIntegrityError(
+                    "Tool-warning event does not match its tool result"
+                )
+            offset += 1
+
+        for error in result.errors:
+            failure_event = required_event(offset, "tool_failure")
+            if failure_event["analytical"] != {
+                "attempt": attempt,
+                "detail": error.to_dict(),
+            } or failure_event["parent_analytical_event_sha256"] != [
+                result_event["analytical_event_sha256"]
+            ]:
+                raise ResearchSessionIntegrityError(
+                    "Tool-failure event does not match its tool result"
+                )
+            offset += 1
+        index += offset
+
+
 def _load_snapshot(path: Path, *, allow_writer_lock: bool = False) -> ResearchSessionSnapshot:
     session = _safe_path(path, must_exist=True, kind="session")
     if (session / ".writer.lock").exists() and not allow_writer_lock:
@@ -733,6 +865,7 @@ def _load_snapshot(path: Path, *, allow_writer_lock: bool = False) -> ResearchSe
         raise ResearchSessionIntegrityError(
             "Session head does not match the complete immutable event history"
         )
+    _verify_tool_lifecycles(events)
     return ResearchSessionSnapshot(
         path=session,
         header=MappingProxyType(dict(header)),
@@ -758,6 +891,35 @@ def _artifact_references(snapshot: ResearchSessionSnapshot) -> tuple[ArtifactRef
     return tuple(references[key] for key in sorted(references))
 
 
+def _verify_snapshot_artifacts(
+    snapshot: ResearchSessionSnapshot,
+    *,
+    allow_changed_mutable_sources: bool,
+) -> None:
+    context = ToolExecutionContext(snapshot.path.parent, reserved_paths=(snapshot.path,))
+    for reference in _artifact_references(snapshot):
+        try:
+            artifact = context.resolve(
+                reference.logical_path,
+                "referenced artifact",
+                kind="file",
+            )
+        except (SafeToolPathError, ToolContractError) as exc:
+            if reference.mutable_source and allow_changed_mutable_sources:
+                continue
+            raise ResearchSessionIntegrityError(
+                f"Referenced artifact is missing or unsafe: {reference.logical_path}"
+            ) from exc
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if digest != reference.sha256:
+            if reference.mutable_source and allow_changed_mutable_sources:
+                continue
+            source_kind = "mutable source" if reference.mutable_source else "immutable artifact"
+            raise ResearchSessionIntegrityError(
+                f"Referenced {source_kind} hash changed: {reference.logical_path}"
+            )
+
+
 def verify_research_session(
     path: Path,
     *,
@@ -766,27 +928,55 @@ def verify_research_session(
 ) -> ResearchSessionSnapshot:
     snapshot = _load_snapshot(path)
     if verify_artifacts:
-        context = ToolExecutionContext(snapshot.path.parent, reserved_paths=(snapshot.path,))
-        for reference in _artifact_references(snapshot):
-            try:
-                artifact = context.resolve(
-                    reference.logical_path,
-                    "referenced artifact",
-                    kind="file",
-                )
-            except (SafeToolPathError, ToolContractError) as exc:
-                raise ResearchSessionIntegrityError(
-                    f"Referenced artifact is missing or unsafe: {reference.logical_path}"
-                ) from exc
-            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-            if digest != reference.sha256:
-                if reference.mutable_source and allow_changed_mutable_sources:
-                    continue
-                source_kind = "mutable source" if reference.mutable_source else "immutable artifact"
-                raise ResearchSessionIntegrityError(
-                    f"Referenced {source_kind} hash changed: {reference.logical_path}"
-                )
+        _verify_snapshot_artifacts(
+            snapshot,
+            allow_changed_mutable_sources=allow_changed_mutable_sources,
+        )
     return snapshot
+
+
+def verify_research_session_prefix(
+    path: Path,
+    *,
+    session_id: str,
+    session_header_sha256: str,
+    event_count: int,
+    head_event_sha256: str,
+    analytical_head_sha256: str,
+    verify_artifacts: bool = False,
+    allow_changed_mutable_sources: bool = False,
+) -> ResearchSessionSnapshot:
+    """Verify the full chain, then return exactly the declared immutable historical prefix."""
+
+    snapshot = _load_snapshot(path)
+    if isinstance(event_count, bool) or not isinstance(event_count, int) or event_count <= 0:
+        raise ResearchSessionIntegrityError("Frozen session event count must be positive")
+    if event_count > len(snapshot.events):
+        raise ResearchSessionIntegrityError("Frozen session prefix extends beyond current history")
+    prefix_event = snapshot.events[event_count - 1]
+    actual_header_sha256 = hashlib.sha256(canonical_json_bytes(dict(snapshot.header))).hexdigest()
+    if (
+        snapshot.header["session_id"] != session_id
+        or actual_header_sha256 != session_header_sha256
+        or prefix_event["event_sha256"] != head_event_sha256
+        or prefix_event["analytical_event_sha256"] != analytical_head_sha256
+    ):
+        raise ResearchSessionIntegrityError(
+            "Frozen session identity does not match the declared immutable prefix"
+        )
+    frozen = ResearchSessionSnapshot(
+        path=snapshot.path,
+        header=snapshot.header,
+        events=snapshot.events[:event_count],
+        head_event_sha256=head_event_sha256,
+        analytical_head_sha256=analytical_head_sha256,
+    )
+    if verify_artifacts:
+        _verify_snapshot_artifacts(
+            frozen,
+            allow_changed_mutable_sources=allow_changed_mutable_sources,
+        )
+    return frozen
 
 
 class _WriterLock:
@@ -874,6 +1064,7 @@ def append_event_batch(
             },
             recorded_at=(clock or (lambda: datetime.now(UTC)))(),
         )
+        _verify_tool_lifecycles((*snapshot.events, *events))
         first = events[0]["sequence"]
         last = events[-1]["sequence"]
         segment = {
@@ -912,6 +1103,18 @@ def _tool_attempts(
         if result.request_identity_sha256 == request_identity_sha256:
             attempts.append((analytical["attempt"], result))
     return attempts
+
+
+def _session_prefix_document(snapshot: ResearchSessionSnapshot) -> dict[str, Any]:
+    return {
+        "analytical_head_sha256": snapshot.analytical_head_sha256,
+        "event_count": len(snapshot.events),
+        "head_event_sha256": snapshot.head_event_sha256,
+        "session_header_sha256": hashlib.sha256(
+            canonical_json_bytes(dict(snapshot.header))
+        ).hexdigest(),
+        "session_id": snapshot.header["session_id"],
+    }
 
 
 def _append_invocation_result(
@@ -988,6 +1191,7 @@ def _append_invocation_result(
         idempotent_retry=False,
         appended_event_count=len(pending),
         analytical_head_sha256=updated.analytical_head_sha256,
+        output_reused=prepared.runtime.get("operation_state", {}).get("evaluation_output_reused"),
     )
 
 
@@ -1011,14 +1215,28 @@ def invoke_research_tool(
     try:
         attempts = _tool_attempts(snapshot, prepared.request_identity_sha256)
         for attempt, result in attempts:
-            if result.resolved_input_identity_sha256 == prepared.resolved_input_identity_sha256:
+            if (
+                result.resolved_input_identity_sha256 == prepared.resolved_input_identity_sha256
+                and dispatcher.can_reuse(prepared, result, context)
+            ):
                 return SessionInvocationReceipt(
                     result=result,
                     attempt=attempt,
                     idempotent_retry=True,
                     appended_event_count=0,
                     analytical_head_sha256=snapshot.analytical_head_sha256,
+                    output_reused=(
+                        True
+                        if request.tool_name == "research_session.evaluate"
+                        and result.status is ToolExecutionStatus.COMPLETE
+                        else None
+                    ),
                 )
+        required_prefix = prepared.runtime.get("required_session_prefix")
+        if required_prefix is not None and required_prefix != _session_prefix_document(snapshot):
+            raise ToolContractError(
+                "Evaluation request must freeze the exact pre-invocation session head"
+            )
         attempt = max((number for number, _ in attempts), default=0) + 1
         result = dispatcher.execute(prepared, context, release_inputs=False)
         return _append_invocation_result(
@@ -1098,8 +1316,12 @@ def session_summary(snapshot: ResearchSessionSnapshot) -> dict[str, Any]:
         "analytical_head_sha256": snapshot.analytical_head_sha256,
         "event_count": len(snapshot.events),
         "event_counts": dict(sorted(event_counts.items())),
+        "head_event_sha256": snapshot.head_event_sha256,
         "objective": snapshot.header["objective"],
         "schema_version": snapshot.header["schema_version"],
+        "session_header_sha256": hashlib.sha256(
+            canonical_json_bytes(dict(snapshot.header))
+        ).hexdigest(),
         "session_id": snapshot.header["session_id"],
         "tool_attempts": attempts,
     }

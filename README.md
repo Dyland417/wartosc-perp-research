@@ -47,6 +47,17 @@ immutable research-session record. The initial allowlist contains only `historic
 warnings, failures, and relative artifact hashes using atomic append-only segments and separate
 integrity and portable analytical hash chains. There is still no LLM or autonomous Research Agent.
 
+Phase 5 checkpoint 2 adds a deterministic critic over one explicitly frozen session prefix. Its
+closed historical-study sufficiency policy re-resolves typed citations, checks allowlisted
+structured claims, preserves warnings and limitations, evaluates ordered completion gates, and
+writes a deterministic verification bundle with an authoritative effective status. Checkpoint 2
+expands the closed catalog only with
+`research_session.evaluate` and
+`research_evaluation.verify`. Evaluation freezes the pre-invocation head, writes the bundle, and
+then records the ordinary request/result/output lifecycle after that head; it cannot evaluate its
+own events. It does not prove free-form conclusions, establish profitability, or authorize live
+trading.
+
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
 ## Architecture
@@ -84,6 +95,8 @@ See [docs/historical-study.md](docs/historical-study.md) for checkpoint-4B study
 artifact contracts, failure semantics, and deterministic output rules.
 See [docs/research-tools-and-sessions.md](docs/research-tools-and-sessions.md) for the Phase 5
 tool registry, session lifecycle, trust boundaries, hash chains, and retry behavior.
+See [docs/research-evaluations.md](docs/research-evaluations.md) for the deterministic critic
+policy, citation contract, frozen-prefix semantics, gates, statuses, and evaluation artifacts.
 
 ## Repository layout
 
@@ -111,6 +124,8 @@ src/wartosc_perp_research/
   research_tools/contracts.py           strict portable tool request/result envelopes
   research_tools/registry.py            closed catalog and deterministic adapters
   research_tools/sessions.py            append-only session persistence and export
+  research_tools/evaluation_contracts.py strict critic requests, citations, findings, and gates
+  research_tools/evaluations.py          deterministic policy, resolution, reports, and verifier
   resources/exchanges.yaml             packaged non-secret defaults
   storage/database.py                  engine and transaction lifecycle
   storage/models.py                    relational schema
@@ -549,13 +564,66 @@ Historical-study invocation holds a SQLite reserved writer barrier from database
 all analytical reads and verifies the bytes again before output promotion. This binds the recorded
 resolved-input identity to the records actually used rather than relying only on before/after
 observations around an unlocked mutable database. Session invocation retains that barrier through
-durable result-event and head promotion.
+the normal-path atomic replacements of the result-event segment and committed head. File contents
+are flushed, but containing-directory power-loss durability is not claimed; interruptions fail
+closed for manual inspection.
 
 Exit `0` includes explicitly marked `incomplete` analytical results. Exit `1` covers recorded tool
 failure, integrity failure, or writer conflict. Exit `2` covers an invalid request, unsupported
 tool/version, or unsafe path. See
 [the research-tool and session contract](docs/research-tools-and-sessions.md) for the full catalog,
 failure taxonomy, persistence policy, and future-agent boundary.
+
+## Deterministic research evaluation
+
+Evaluate exactly the immutable session prefix declared by a version-1 evaluation request, then
+independently re-resolve the saved bundle against that session:
+
+```text
+wpr research session evaluate \
+  --session work/session \
+  --request evaluation-request.json \
+  --output outputs/evaluation
+
+wpr research evaluation verify \
+  --input outputs/evaluation \
+  --session work/session
+```
+
+Policy `wartosc.historical-study-sufficiency/1.0.0` is the only accepted policy. It requires one
+explicit historical-study target and binds citations to the exact session, analytical prefix,
+event, tool attempt, artifact hash/schema, and—where applicable—a constrained JSON Pointer.
+Multiple study attempts are never selected implicitly. Later session events do not become part of
+an earlier evaluation, and assessing a newer head requires a new request.
+
+The critic returns `needs_data`, `rejected`, `provisional`, or
+`accepted_for_further_testing`. The researcher may choose a more conservative status but cannot
+use a more permissive selection to override the gates. Warnings remain present with their source
+identity and disposition; a prose claim that a warning is resolved is not evidence. The emitted
+`effective_status` equals a valid permitted researcher selection, otherwise the critic's
+recommendation, and is the status downstream consumers must use.
+
+The output directory contains exactly `evaluation-request.json`, `evaluation.json`, `report.md`,
+and `manifest.json`. Identical reruns are byte-identical and idempotent; different existing output
+is protected. The CLI invokes the allowlisted `research_session.evaluate` tool. Its request must
+name the exact session head immediately before first invocation. Only after the immutable bundle
+exists does the session append its validated request, resolved input, result, and four output
+artifact references. An identical retry appends nothing. Verification uses the allowlisted
+`research_evaluation.verify` tool. It leaves the bundle and source evidence unchanged and emits no
+output artifacts, but its session invocation records a verification lifecycle after the session's
+then-current head, which may be well after the frozen prefix.
+
+Bundle promotion and session recording are deliberately separate. A crash or stale-writer race can
+leave a complete unreferenced bundle; retry binds it only while the session still ends at the same
+H. A post-promotion evidence-race failure leaves exact bundle bytes for audit rather than deleting
+a path another process might have replaced. Abrupt termination can leave a staging directory or
+writer lock requiring manual inspection.
+
+Exit `0` means the evaluation is valid, including a negative or incomplete research decision.
+Exit `1` means integrity, persistence, or runtime failure. Exit `2` means an invalid contract,
+unsupported policy/schema, unsafe path, or conflicting output. These process codes do not change
+the research status. See [the evaluation contract](docs/research-evaluations.md) for the exact
+claim vocabulary, warning policy, gates, and interpretation limits.
 
 ## Funding research workflow
 

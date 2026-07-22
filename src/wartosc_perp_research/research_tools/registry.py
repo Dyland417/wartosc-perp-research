@@ -41,16 +41,58 @@ from .contracts import (
     validate_keys,
 )
 
-TOOL_CATALOG_VERSION = "1.0.0"
+TOOL_CATALOG_VERSION = "1.1.0"
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SECRET_PATH = re.compile(r"(?:gh[opsu]_|sk-|AKIA)", re.IGNORECASE)
-_STUDY_LIMITATIONS = (
+HISTORICAL_STUDY_LIMITATIONS = (
     "Single-instrument deterministic historical study; this is not live execution.",
     "Results depend on supplied position intents and execution assumptions and do not prove "
     "future profitability.",
     "The accounting model excludes queue position, partial fills, market impact, liquidation, "
     "margin, and portfolio effects.",
 )
+_EVALUATION_LIMITATIONS = (
+    "The deterministic critic checks declared structured evidence and policy gates; it does not "
+    "establish profitability.",
+    "Free-form natural-language claims are preserved but are not semantically proved.",
+    "An evaluation decision does not authorize live trading or replace human research judgment.",
+)
+ACCOUNTING_WARNING_CODES_BY_MESSAGE = MappingProxyType(
+    {
+        "This is a deterministic accounting simulation, not evidence of an executable strategy.": (
+            "accounting_warning_01"
+        ),
+        "Fill events are explicit full-fill assumptions; latency, partial fills, queue position, "
+        "capacity, and market impact are not modeled.": "accounting_warning_02",
+        "Funding cash flow requires an explicit oracle price because Hyperliquid funding uses "
+        "position size multiplied by oracle price and funding rate.": "accounting_warning_03",
+        "Margin, leverage constraints, liquidation, and cross-position collateral are not "
+        "modeled.": ("accounting_warning_04"),
+        "Scenarios begin flat, so initial equity equals initial cash. Signed marked position "
+        "notional is exposure and is not added to cash or equity.": "accounting_warning_05",
+        "Oracle-price provenance is supplied by the scenario and is not independently verified "
+        "by this accounting kernel.": "accounting_warning_06",
+        "Nonnegative fee rates are explicit scenario assumptions applied to absolute execution "
+        "notional; maker rebates and venue fee tiers are not modeled.": "accounting_warning_07",
+        "Slippage cost is an attribution relative to each fill's reference price and is not "
+        "subtracted twice from P&L; execution prices already determine realized/unrealized P&L.": (
+            "accounting_warning_08"
+        ),
+        "The scenario uses finalized retrospective data and does not prove that every input "
+        "was observable at the simulated decision time.": "accounting_warning_09",
+    }
+)
+KNOWN_ACCOUNTING_WARNING_CODES = frozenset(ACCOUNTING_WARNING_CODES_BY_MESSAGE.values())
+
+
+def accounting_warning_code(message: str) -> str:
+    """Return a stable policy code without deriving identity from list position."""
+
+    known = ACCOUNTING_WARNING_CODES_BY_MESSAGE.get(message)
+    if known is not None:
+        return known
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
+    return f"accounting_warning_unclassified_{digest}"
 
 
 def _is_link_or_reparse(path: Path) -> bool:
@@ -195,6 +237,7 @@ class PreparedToolRequest:
 Validator = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 Resolver = Callable[[ToolRequest, Mapping[str, Any], ToolExecutionContext], PreparedToolRequest]
 Executor = Callable[[PreparedToolRequest, ToolExecutionContext], ToolResult]
+CacheValidator = Callable[[PreparedToolRequest, ToolResult, ToolExecutionContext], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +250,7 @@ class ToolDefinition:
     validator: Validator
     resolver: Resolver
     executor: Executor
+    cache_validator: CacheValidator | None = None
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -329,6 +373,24 @@ class ResearchToolDispatcher:
             if release_inputs:
                 self.release(prepared)
 
+    def can_reuse(
+        self,
+        prepared: PreparedToolRequest,
+        result: ToolResult,
+        context: ToolExecutionContext,
+    ) -> bool:
+        """Revalidate tool-specific transitive evidence before returning a cached result."""
+
+        definition = self.registry.resolve(
+            prepared.request.tool_name, prepared.request.schema_version
+        )
+        if definition.cache_validator is None:
+            return True
+        try:
+            return definition.cache_validator(prepared, result, context)
+        except Exception:
+            return False
+
     @staticmethod
     def release(prepared: PreparedToolRequest) -> None:
         barrier = prepared.runtime.get("database_read_barrier")
@@ -406,6 +468,18 @@ def _validate_verify(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
     )
 
 
+def _validate_evaluate(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _validate_path_arguments(
+        arguments, {"request", "output"}, "Research-session evaluation arguments"
+    )
+
+
+def _validate_evaluation_verify(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _validate_path_arguments(
+        arguments, {"bundle"}, "Research-evaluation verification arguments"
+    )
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -431,10 +505,16 @@ def _reference(
     role: str,
     *,
     mutable_source: bool = False,
+    expected_sha256: str | None = None,
 ) -> ArtifactReference:
+    if not path.is_file() or _is_link_or_reparse(path):
+        raise SafeToolPathError("Artifact reference must identify a regular non-link file")
+    digest = _sha256_file(path)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ToolInputConflictError("Artifact changed while its identity was being resolved")
     return ArtifactReference(
         logical_path=context.logical_path(path),
-        sha256=_sha256_file(path),
+        sha256=digest,
         role=role,
         media_type=_media_type(path),
         mutable_source=mutable_source,
@@ -543,6 +623,110 @@ def _resolve_verify(
     )
 
 
+def _reserved_session_path(context: ToolExecutionContext) -> Path:
+    if len(context.reserved_paths) != 1:
+        raise ToolContractError(
+            "This tool must be invoked through exactly one immutable research session"
+        )
+    session_path = context.reserved_paths[0]
+    if not session_path.exists() or not session_path.is_dir() or _is_link_or_reparse(session_path):
+        raise SafeToolPathError("The invoking research session path is missing or unsafe")
+    return session_path
+
+
+def _resolve_evaluate(
+    request: ToolRequest,
+    arguments: Mapping[str, Any],
+    context: ToolExecutionContext,
+) -> PreparedToolRequest:
+    # Local imports avoid a registry -> evaluations -> registry import cycle.
+    from .evaluations import parse_evaluation_request
+
+    session_path = _reserved_session_path(context)
+    request_path = context.resolve(arguments["request"], "request", kind="file")
+    output_path = context.resolve(arguments["output"], "output", kind="output")
+    request_bytes = request_path.read_bytes()
+    evaluation_request = parse_evaluation_request(request_bytes)
+    request_sha256 = hashlib.sha256(request_bytes).hexdigest()
+    request_reference = _reference(
+        request_path,
+        context,
+        "research_evaluation_request",
+        mutable_source=True,
+        expected_sha256=request_sha256,
+    )
+    return PreparedToolRequest(
+        request=request,
+        normalized_arguments=arguments,
+        request_identity_sha256=_request_identity(request, arguments),
+        resolved_input_identity_sha256=canonical_sha256(
+            {
+                "evaluation_request": evaluation_request.to_dict(),
+                "evaluation_request_sha256": request_sha256,
+                "tool_name": request.tool_name,
+                "tool_schema_version": request.schema_version,
+            }
+        ),
+        input_artifacts=(request_reference,),
+        runtime=MappingProxyType(
+            {
+                "evaluation_request": evaluation_request,
+                "evaluation_request_path": request_path,
+                "evaluation_request_sha256": request_sha256,
+                "output_path": output_path,
+                "operation_state": {},
+                "required_session_prefix": evaluation_request.evaluated_session.to_dict(),
+                "session_path": session_path,
+            }
+        ),
+    )
+
+
+def _evaluation_bundle_snapshot(
+    bundle_path: Path,
+    context: ToolExecutionContext,
+) -> tuple[list[dict[str, Any]], tuple[ArtifactReference, ...]]:
+    entries: list[dict[str, Any]] = []
+    references: list[ArtifactReference] = []
+    for child in sorted(bundle_path.iterdir(), key=lambda item: item.name):
+        if child.is_file() and not _is_link_or_reparse(child):
+            reference = _reference(child, context, "research_evaluation_bundle_input")
+            references.append(reference)
+            entries.append({"logical_path": reference.logical_path, "sha256": reference.sha256})
+        else:
+            entries.append({"invalid_entry": context.logical_path(child)})
+    return entries, tuple(references)
+
+
+def _resolve_evaluation_verify(
+    request: ToolRequest,
+    arguments: Mapping[str, Any],
+    context: ToolExecutionContext,
+) -> PreparedToolRequest:
+    session_path = _reserved_session_path(context)
+    bundle_path = context.resolve(arguments["bundle"], "bundle", kind="directory")
+    entries, references = _evaluation_bundle_snapshot(bundle_path, context)
+    return PreparedToolRequest(
+        request=request,
+        normalized_arguments=arguments,
+        request_identity_sha256=_request_identity(request, arguments),
+        resolved_input_identity_sha256=canonical_sha256(
+            {
+                "bundle_entries": entries,
+                "tool_name": request.tool_name,
+                "tool_schema_version": request.schema_version,
+            }
+        ),
+        input_artifacts=references,
+        runtime=MappingProxyType(
+            {
+                "bundle_path": bundle_path,
+                "session_path": session_path,
+            }
+        ),
+    )
+
+
 def _bundle_identity(manifest: Mapping[str, Any]) -> str:
     identity = manifest.get("identity", {})
     market_data = manifest.get("market_data", {})
@@ -575,8 +759,8 @@ def _bundle_warnings(
     accounting_warnings = accounting.get("warnings", [])
     if isinstance(accounting_warnings, list):
         warnings.extend(
-            ToolWarning(code=f"accounting_warning_{index:02d}", message=message)
-            for index, message in enumerate(accounting_warnings, start=1)
+            ToolWarning(code=accounting_warning_code(message), message=message)
+            for message in accounting_warnings
             if isinstance(message, str)
         )
     metric_warnings = metrics.get("warnings", [])
@@ -669,7 +853,7 @@ def _execute_run(prepared: PreparedToolRequest, context: ToolExecutionContext) -
         input_artifacts=prepared.input_artifacts,
         output_artifacts=output_artifacts,
         warnings=_bundle_warnings(bundle.files, manifest),
-        limitations=_STUDY_LIMITATIONS,
+        limitations=HISTORICAL_STUDY_LIMITATIONS,
         errors=(),
         evidence=_bundle_evidence(manifest),
     )
@@ -689,10 +873,253 @@ def _execute_verify(prepared: PreparedToolRequest, context: ToolExecutionContext
         input_artifacts=prepared.input_artifacts,
         output_artifacts=(),
         warnings=_bundle_warnings(bundle.files, manifest),
-        limitations=_STUDY_LIMITATIONS,
+        limitations=HISTORICAL_STUDY_LIMITATIONS,
         errors=(),
         evidence=_bundle_evidence(manifest),
     )
+
+
+def _evaluation_evidence(bundle: object) -> dict[str, Any]:
+    result = bundle.result
+    return {
+        "bundle_type": "deterministic_research_evaluation",
+        "critic_recommended_status": result.critic_recommended_status.value,
+        "effective_status": result.effective_status.value,
+        "evaluated_session": result.evaluated_session.to_dict(),
+        "gate_statuses": {
+            gate.gate_id: gate.status.value
+            for gate in sorted(result.gates, key=lambda item: item.gate_id)
+        },
+        "policy": result.policy.to_dict(),
+        "researcher_selected_status": (
+            None
+            if result.researcher_selected_status is None
+            else result.researcher_selected_status.value
+        ),
+        "researcher_status_permitted": result.researcher_status_permitted,
+    }
+
+
+def _evaluation_success_result(
+    prepared: PreparedToolRequest,
+    bundle: object,
+    *,
+    output_artifacts: tuple[ArtifactReference, ...] = (),
+) -> ToolResult:
+    return ToolResult(
+        tool_name=prepared.request.tool_name,
+        tool_schema_version=prepared.request.schema_version,
+        status=ToolExecutionStatus.COMPLETE,
+        request_identity_sha256=prepared.request_identity_sha256,
+        resolved_input_identity_sha256=prepared.resolved_input_identity_sha256,
+        portable_analytical_identity_sha256=(bundle.result.portable_evaluation_identity_sha256),
+        input_artifacts=prepared.input_artifacts,
+        output_artifacts=output_artifacts,
+        warnings=(),
+        limitations=_EVALUATION_LIMITATIONS,
+        errors=(),
+        evidence=_evaluation_evidence(bundle),
+    )
+
+
+def _evaluation_output_references(
+    bundle: object,
+    context: ToolExecutionContext,
+) -> tuple[ArtifactReference, ...]:
+    expected_names = set(bundle.files)
+    if {item.name for item in bundle.path.iterdir()} != expected_names:
+        raise ToolInputConflictError("Evaluation output changed before artifact binding")
+    references: list[ArtifactReference] = []
+    for name, content in sorted(bundle.files.items()):
+        path = bundle.path / name
+        expected_digest = hashlib.sha256(content).hexdigest()
+        reference = _reference(
+            path,
+            context,
+            "research_evaluation_output",
+            expected_sha256=expected_digest,
+        )
+        if path.read_bytes() != content:
+            raise ToolInputConflictError("Evaluation output changed during artifact binding")
+        references.append(reference)
+    if {item.name for item in bundle.path.iterdir()} != expected_names or any(
+        (bundle.path / name).read_bytes() != content for name, content in bundle.files.items()
+    ):
+        raise ToolInputConflictError("Evaluation output changed during artifact binding")
+    return tuple(references)
+
+
+def _execute_evaluate(prepared: PreparedToolRequest, context: ToolExecutionContext) -> ToolResult:
+    from .evaluations import (
+        ResearchEvaluationConflictError,
+        ResearchEvaluationIntegrityError,
+        ResearchEvaluationPathError,
+        evaluate_research_session,
+    )
+
+    request_path = prepared.runtime["evaluation_request_path"]
+    expected_request_sha256 = prepared.runtime["evaluation_request_sha256"]
+    if _sha256_file(request_path) != expected_request_sha256:
+        raise ToolInputConflictError("Evaluation request changed after input resolution")
+    try:
+        bundle = evaluate_research_session(
+            prepared.runtime["session_path"],
+            prepared.runtime["evaluation_request"],
+            prepared.runtime["output_path"],
+        )
+        prepared.runtime["operation_state"]["evaluation_output_reused"] = bundle.idempotent
+    except (ResearchEvaluationConflictError, ResearchEvaluationPathError) as exc:
+        return _failure(
+            prepared,
+            FailureCategory.UNSAFE_PATH_OR_OUTPUT_CONFLICT,
+            "evaluation_output_conflict",
+            _portable_message(str(exc), context),
+        )
+    except ResearchEvaluationIntegrityError as exc:
+        return _failure(
+            prepared,
+            FailureCategory.ARTIFACT_INTEGRITY_FAILURE,
+            "evaluation_evidence_integrity",
+            _portable_message(str(exc), context),
+        )
+    if _sha256_file(request_path) != expected_request_sha256:
+        raise ToolInputConflictError("Evaluation request changed during deterministic evaluation")
+    return _evaluation_success_result(
+        prepared,
+        bundle,
+        output_artifacts=_evaluation_output_references(bundle, context),
+    )
+
+
+def _cached_evaluation_is_current(
+    prepared: PreparedToolRequest,
+    result: ToolResult,
+    context: ToolExecutionContext,
+) -> bool:
+    if result.status is ToolExecutionStatus.FAILED:
+        return True
+    from .evaluations import verify_research_evaluation
+
+    request_path = prepared.runtime["evaluation_request_path"]
+    if _sha256_file(request_path) != prepared.runtime["evaluation_request_sha256"]:
+        return False
+    bundle = verify_research_evaluation(
+        prepared.runtime["output_path"], prepared.runtime["session_path"]
+    )
+    if bundle.request != prepared.runtime["evaluation_request"]:
+        return False
+    expected = _evaluation_success_result(
+        prepared,
+        bundle,
+        output_artifacts=_evaluation_output_references(bundle, context),
+    )
+    return result == expected and (
+        _sha256_file(request_path) == prepared.runtime["evaluation_request_sha256"]
+    )
+
+
+def _assert_evaluation_verify_input_stable(
+    prepared: PreparedToolRequest,
+    context: ToolExecutionContext,
+    *,
+    returned_files: Mapping[str, bytes] | None = None,
+) -> None:
+    bundle_path = prepared.runtime["bundle_path"]
+    entries, references = _evaluation_bundle_snapshot(bundle_path, context)
+    current_identity = canonical_sha256(
+        {
+            "bundle_entries": entries,
+            "tool_name": prepared.request.tool_name,
+            "tool_schema_version": prepared.request.schema_version,
+        }
+    )
+    if current_identity != prepared.resolved_input_identity_sha256 or [
+        item.to_dict() for item in references
+    ] != [item.to_dict() for item in prepared.input_artifacts]:
+        raise ToolInputConflictError("Evaluation bundle changed after input resolution")
+    if returned_files is not None:
+        expected = {item.logical_path: item.sha256 for item in prepared.input_artifacts}
+        returned = {
+            context.logical_path(bundle_path / name): hashlib.sha256(content).hexdigest()
+            for name, content in returned_files.items()
+        }
+        if returned != expected:
+            raise ToolInputConflictError(
+                "Verified evaluation bytes do not match the resolved input identity"
+            )
+
+
+def _execute_evaluation_verify(
+    prepared: PreparedToolRequest, context: ToolExecutionContext
+) -> ToolResult:
+    from .evaluation_contracts import EvaluationContractError
+    from .evaluations import (
+        ResearchEvaluationIntegrityError,
+        ResearchEvaluationPathError,
+        verify_research_evaluation,
+    )
+    from .sessions import ResearchSessionIntegrityError
+
+    try:
+        _assert_evaluation_verify_input_stable(prepared, context)
+        bundle = verify_research_evaluation(
+            prepared.runtime["bundle_path"], prepared.runtime["session_path"]
+        )
+        _assert_evaluation_verify_input_stable(
+            prepared,
+            context,
+            returned_files=bundle.files,
+        )
+    except EvaluationContractError as exc:
+        return _failure(
+            prepared,
+            FailureCategory.INVALID_REQUEST,
+            "evaluation_contract_unsupported",
+            _portable_message(str(exc), context),
+        )
+    except ResearchEvaluationPathError as exc:
+        return _failure(
+            prepared,
+            FailureCategory.UNSAFE_PATH_OR_OUTPUT_CONFLICT,
+            "evaluation_bundle_path_invalid",
+            _portable_message(str(exc), context),
+        )
+    except (ResearchEvaluationIntegrityError, ResearchSessionIntegrityError) as exc:
+        return _failure(
+            prepared,
+            FailureCategory.ARTIFACT_INTEGRITY_FAILURE,
+            "evaluation_bundle_integrity",
+            _portable_message(str(exc), context),
+        )
+    except ToolInputConflictError as exc:
+        return _failure(
+            prepared,
+            FailureCategory.INTERNAL_OPERATIONAL_FAILURE,
+            "evaluation_input_changed",
+            _portable_message(str(exc), context),
+        )
+    return _evaluation_success_result(prepared, bundle)
+
+
+def _cached_evaluation_verification_is_current(
+    prepared: PreparedToolRequest,
+    result: ToolResult,
+    context: ToolExecutionContext,
+) -> bool:
+    if result.status is ToolExecutionStatus.FAILED:
+        return True
+    from .evaluations import verify_research_evaluation
+
+    _assert_evaluation_verify_input_stable(prepared, context)
+    bundle = verify_research_evaluation(
+        prepared.runtime["bundle_path"], prepared.runtime["session_path"]
+    )
+    _assert_evaluation_verify_input_stable(
+        prepared,
+        context,
+        returned_files=bundle.files,
+    )
+    return result == _evaluation_success_result(prepared, bundle)
 
 
 def _failure(
@@ -711,7 +1138,11 @@ def _failure(
         input_artifacts=prepared.input_artifacts,
         output_artifacts=(),
         warnings=(),
-        limitations=_STUDY_LIMITATIONS,
+        limitations=(
+            _EVALUATION_LIMITATIONS
+            if prepared.request.tool_name.startswith("research_")
+            else HISTORICAL_STUDY_LIMITATIONS
+        ),
         errors=(ToolError(category=category, code=code, message=message),),
         evidence={},
     )
@@ -756,6 +1187,18 @@ _VERIFY_SCHEMA = {
     "required": ["bundle"],
     "type": "object",
 }
+_EVALUATE_SCHEMA = {
+    "additionalProperties": False,
+    "properties": {"output": _PATH_SCHEMA, "request": _PATH_SCHEMA},
+    "required": ["output", "request"],
+    "type": "object",
+}
+_EVALUATION_VERIFY_SCHEMA = {
+    "additionalProperties": False,
+    "properties": {"bundle": _PATH_SCHEMA},
+    "required": ["bundle"],
+    "type": "object",
+}
 
 DEFAULT_REGISTRY = ResearchToolRegistry(
     (
@@ -786,6 +1229,33 @@ DEFAULT_REGISTRY = ResearchToolRegistry(
             validator=_validate_verify,
             resolver=_resolve_verify,
             executor=_execute_verify,
+        ),
+        ToolDefinition(
+            name="research_evaluation.verify",
+            schema_version=1,
+            summary=(
+                "Verify a deterministic evaluation bundle against its exact frozen session "
+                "evidence."
+            ),
+            authority=("wartosc_perp_research.research_tools.verify_research_evaluation"),
+            request_schema=_EVALUATION_VERIFY_SCHEMA,
+            validator=_validate_evaluation_verify,
+            resolver=_resolve_evaluation_verify,
+            executor=_execute_evaluation_verify,
+            cache_validator=_cached_evaluation_verification_is_current,
+        ),
+        ToolDefinition(
+            name="research_session.evaluate",
+            schema_version=1,
+            summary=(
+                "Evaluate the exact pre-invocation session prefix under the closed critic policy."
+            ),
+            authority="wartosc_perp_research.research_tools.evaluate_research_session",
+            request_schema=_EVALUATE_SCHEMA,
+            validator=_validate_evaluate,
+            resolver=_resolve_evaluate,
+            executor=_execute_evaluate,
+            cache_validator=_cached_evaluation_is_current,
         ),
     )
 )

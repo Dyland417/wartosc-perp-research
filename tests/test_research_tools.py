@@ -32,6 +32,8 @@ from wartosc_perp_research.research_tools import (
     UnsupportedToolError,
     append_event_batch,
     append_researcher_event,
+    canonical_json_bytes,
+    canonical_sha256,
     create_research_session,
     export_research_session,
     invoke_research_tool,
@@ -295,6 +297,8 @@ def test_tool_catalog_is_closed_versioned_and_describable(tmp_path: Path) -> Non
     assert [(item["name"], item["schema_version"]) for item in listing] == [
         ("historical_study.run", 1),
         ("historical_study.verify", 1),
+        ("research_evaluation.verify", 1),
+        ("research_session.evaluate", 1),
     ]
     assert listing[0]["request_schema"]["additionalProperties"] is False
     assert "run_historical_study" in listing[0]["authority"]
@@ -340,6 +344,85 @@ def test_session_creation_is_canonical_and_contains_no_operational_clock_in_head
         )
 
 
+def test_second_session_creation_is_rejected_before_persistence(research_root: Path) -> None:
+    session = _session(research_root)
+    before = verify_research_session(session, verify_artifacts=False)
+    with pytest.raises(ResearchSessionIntegrityError, match="only valid as the first"):
+        append_event_batch(
+            session,
+            (
+                PendingSessionEvent(
+                    "session_created",
+                    {
+                        "session_header_sha256": hashlib.sha256(
+                            (session / "session.json").read_bytes()
+                        ).hexdigest()
+                    },
+                ),
+            ),
+            expected_head_sha256=before.head_event_sha256,
+            clock=CLOCK,
+        )
+
+    after = verify_research_session(session, verify_artifacts=False)
+    assert after.head_event_sha256 == before.head_event_sha256
+    assert len(after.events) == 1
+    assert len(tuple((session / "events").glob("*.json"))) == 1
+    assert not (session / ".writer.lock").exists()
+
+
+def test_self_consistently_rehashed_second_session_creation_is_rejected(
+    research_root: Path,
+) -> None:
+    session = _session(research_root)
+    append_researcher_event(
+        session,
+        {"schema_version": 1, "event_type": "note", "text": "Replace this event."},
+        clock=CLOCK,
+    )
+    segment_path = sorted((session / "events").glob("*.json"))[-1]
+    segment = json.loads(segment_path.read_text(encoding="utf-8"))
+    event = segment["events"][0]
+    event["event_type"] = "session_created"
+    event["analytical"] = {
+        "session_header_sha256": hashlib.sha256((session / "session.json").read_bytes()).hexdigest()
+    }
+    analytical_document = {
+        key: event[key]
+        for key in (
+            "analytical",
+            "event_type",
+            "parent_analytical_event_sha256",
+            "previous_analytical_event_sha256",
+            "schema_version",
+            "sequence",
+        )
+    }
+    event["analytical_event_sha256"] = canonical_sha256(analytical_document)
+    full_document = {
+        **analytical_document,
+        "analytical_event_sha256": event["analytical_event_sha256"],
+        "operational": event["operational"],
+        "previous_event_sha256": event["previous_event_sha256"],
+    }
+    event["event_sha256"] = canonical_sha256(full_document)
+    segment_path.write_bytes(canonical_json_bytes(segment))
+    (session / "head.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "analytical_head_sha256": event["analytical_event_sha256"],
+                "event_count": 2,
+                "head_event_sha256": event["event_sha256"],
+                "last_sequence": 2,
+                "schema_version": 1,
+            }
+        )
+    )
+
+    with pytest.raises(ResearchSessionIntegrityError, match="only valid as the first"):
+        verify_research_session(session, verify_artifacts=False)
+
+
 def test_mature_tool_invocation_records_evidence_and_is_idempotent(
     research_root: Path,
 ) -> None:
@@ -367,6 +450,87 @@ def test_mature_tool_invocation_records_evidence_and_is_idempotent(
     assert retry.idempotent_retry is True
     assert retry.appended_event_count == 0
     assert retry.analytical_head_sha256 == snapshot.analytical_head_sha256
+
+
+def test_partial_or_orphaned_tool_lifecycle_is_rejected_before_persistence(
+    research_root: Path,
+) -> None:
+    session = _session(research_root)
+    before = verify_research_session(session, verify_artifacts=False)
+    with pytest.raises(ResearchSessionIntegrityError, match="Orphaned"):
+        append_event_batch(
+            session,
+            (
+                PendingSessionEvent(
+                    "tool_warning",
+                    {
+                        "attempt": 1,
+                        "detail": {"code": "orphaned", "message": "No result parent."},
+                    },
+                ),
+            ),
+            expected_head_sha256=before.head_event_sha256,
+            clock=CLOCK,
+        )
+    after = verify_research_session(session, verify_artifacts=False)
+    assert after.head_event_sha256 == before.head_event_sha256
+    assert not (session / ".writer.lock").exists()
+
+
+def test_self_consistently_rehashed_lifecycle_mismatch_still_fails_verification(
+    research_root: Path,
+) -> None:
+    session = _session(research_root)
+    invoke_research_tool(session, _request(), clock=CLOCK)
+    segment_path = sorted((session / "events").glob("*.json"))[-1]
+    segment = json.loads(segment_path.read_text(encoding="utf-8"))
+    output_event = next(
+        event for event in segment["events"] if event["event_type"] == "output_artifact_references"
+    )
+    output_event["analytical"]["artifacts"] = output_event["analytical"]["artifacts"][:-1]
+
+    previous_full = segment["previous_event_sha256"]
+    previous_analytical = segment["events"][0]["previous_analytical_event_sha256"]
+    for event in segment["events"]:
+        event["previous_event_sha256"] = previous_full
+        event["previous_analytical_event_sha256"] = previous_analytical
+        analytical_document = {
+            key: event[key]
+            for key in (
+                "analytical",
+                "event_type",
+                "parent_analytical_event_sha256",
+                "previous_analytical_event_sha256",
+                "schema_version",
+                "sequence",
+            )
+        }
+        event["analytical_event_sha256"] = canonical_sha256(analytical_document)
+        full_document = {
+            **analytical_document,
+            "analytical_event_sha256": event["analytical_event_sha256"],
+            "operational": event["operational"],
+            "previous_event_sha256": previous_full,
+        }
+        event["event_sha256"] = canonical_sha256(full_document)
+        previous_full = event["event_sha256"]
+        previous_analytical = event["analytical_event_sha256"]
+
+    segment_path.write_bytes(canonical_json_bytes(segment))
+    event_count = segment["last_sequence"]
+    (session / "head.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "analytical_head_sha256": previous_analytical,
+                "event_count": event_count,
+                "head_event_sha256": previous_full,
+                "last_sequence": event_count,
+                "schema_version": 1,
+            }
+        )
+    )
+    with pytest.raises(ResearchSessionIntegrityError, match="Output-artifact event"):
+        verify_research_session(session, verify_artifacts=False)
 
 
 def test_bundle_verification_tool_calls_canonical_validator(research_root: Path) -> None:
@@ -950,7 +1114,7 @@ def test_cli_discovery_session_vertical_and_exit_codes(
 ) -> None:
     assert cli.main(["research", "tools", "list"]) == 0
     catalog = json.loads(capsys.readouterr().out)
-    assert len(catalog["tools"]) == 2
+    assert len(catalog["tools"]) == 4
     assert cli.main(["research", "tools", "describe", "historical_study.run"]) == 0
     assert json.loads(capsys.readouterr().out)["tool"]["versions"][0]["schema_version"] == 1
     session_spec = research_root / "session-spec.json"

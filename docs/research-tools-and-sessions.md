@@ -5,6 +5,11 @@ introducing an LLM, an autonomous loop, or a new analytical authority. A human o
 orchestrator may select a registered tool and inspect its structured evidence. It may not replace
 the deterministic implementation behind that tool.
 
+Phase 5 checkpoint 2 adds a deterministic evaluation boundary over one explicitly frozen prefix
+of this evidence. It narrowly extends the same closed registry with two evaluation tools and makes
+session verification enforce the already-written canonical tool lifecycle. See
+`docs/research-evaluations.md` for its exact citation, policy, finding, gate, and artifact schemas.
+
 ```text
 research objective
         |
@@ -26,13 +31,16 @@ dependency, and no prompt loop is executed or persisted.
 
 ## Initial tool catalog
 
-The catalog itself is versioned `1.0.0`. Every tool independently has a positive integer schema
-version. Checkpoint 1 intentionally exposes only two schema-v1 tools.
+The catalog is versioned `1.1.0`. Every tool independently has a positive integer schema version.
+Checkpoint 1 exposed two historical-study tools; checkpoint 2 adds exactly two narrow evaluation
+tools.
 
 | Tool | Authoritative implementation | Why it is exposed |
 | --- | --- | --- |
 | `historical_study.run` | `backtests.run_historical_study` and `backtests.write_historical_study_bundle` | The workflow already composes point-in-time assembly, accounting, metrics, deterministic serializers, a complete manifest, dependency validation, and transactional directory promotion. |
 | `historical_study.verify` | `backtests.load_historical_study_bundle` | The canonical bundle already has a closed artifact set, strict schemas, content hashes, analytical identities, and dependency-graph validation. |
+| `research_session.evaluate` | `research_tools.evaluate_research_session` | The adapter evaluates only the request's exact pre-invocation prefix, writes the closed bundle, and records its immutable outputs after that prefix. |
+| `research_evaluation.verify` | `research_tools.verify_research_evaluation` | The adapter re-resolves a closed evaluation bundle against its source session and records a read-only verification result. |
 
 Funding coverage, price coverage, scenario assembly, scenario accounting, and standalone metrics
 remain deterministic internal/application capabilities. They are not yet registered tools because
@@ -41,6 +49,11 @@ portable verification contract. The registry does not automatically expose Pytho
 
 The catalog never contains generic SQL, filesystem browsing, Python execution, shell execution,
 dynamic import, unrestricted HTTP, or web-search tools.
+
+The evaluation additions accept only safe relative request/bundle/output paths. They are not
+generic rule engines or artifact-query tools and may consume only the closed evaluation contract,
+evidence produced by the two allowlisted historical-study tools, and researcher-authored session
+events.
 
 ## Tool request contract
 
@@ -75,7 +88,10 @@ records between identity resolution and consumption. A non-cooperative file muta
 reads changes the post-read hash and prevents a successful result. Active journal/WAL sidecars are
 rejected because one main-file hash would not identify their committed state.
 For a session invocation, the barrier remains held until the result event segment and committed
-head are durably promoted, so a successful session record cannot race a cooperative source update.
+head have both been atomically replaced on the normal return path, so a successful session record
+cannot race a cooperative source update. The implementation flushes file contents but does not
+claim power-loss durability for containing-directory metadata; a hard interruption is handled by
+the fail-closed recovery rules below.
 
 ## Structured result envelope
 
@@ -147,8 +163,11 @@ hash, optional causal parent hashes, and two identities:
 
 - `event_sha256` covers analytical payload, parents, ordering, operational provenance, and the
   preceding full hash. It detects any mutation, deletion, or reorder in the persisted history.
-- `analytical_event_sha256` excludes the operational timestamp and chains only portable analytical
-  content. Portable exports therefore remain byte-identical across repeated exports.
+- `analytical_event_sha256` excludes that event's direct operational timestamp and chains its
+  analytical payload. This is the session's clock-insensitive chain, not a promise that arbitrary
+  later payloads cannot transitively bind operational identities such as an exact frozen full head
+  or request-file hash. Portable exports of the same session remain byte-identical; cross-run
+  evaluation identity is provided separately by `portable_evaluation_identity_sha256`.
 
 The first event binds the SHA-256 of `session.json`. Segment filenames encode their exact inclusive
 sequence range. Unexpected files, partial temporary files, range gaps, malformed parents,
@@ -213,6 +232,41 @@ not copy SQLite databases, raw API archives, or generated bundle contents. Opera
 remain in local event records for audit purposes but are explicitly omitted from portable exports
 and analytical identity.
 
+## Frozen-prefix evaluation relationship
+
+An evaluation request names a historical session prefix with session ID, session-header SHA-256,
+event count, full event-chain head, and analytical-chain head. Prefix verification validates the
+complete current session chain and then returns exactly events `1..event_count`. Valid later events
+therefore do not silently enter an earlier evaluation, while mutation of any persisted chain data
+still fails closed.
+
+Evaluation citations bind to that prefix and identify exact session events, tool results, or
+allowlisted scalar fields in immutable historical-study JSON artifacts. The evaluation verifier
+re-resolves them against the session and the closed historical-study bundle; a saved evaluation is
+not treated as self-authenticating.
+
+The evaluation adapter requires its request to equal the exact session head H seen immediately
+before first invocation. The evaluator writes the separate four-file bundle while assessing only
+H. After the bundle exists, normal session machinery atomically appends the validated request,
+resolved request hash, tool result, and immutable output references. Those events are strictly
+after H and therefore cannot enter the evaluation they describe. An identical retry returns the
+recorded result and appends nothing. A changed request must freeze the newer current head and use a
+new output. The verification adapter follows the same canonical lifecycle but produces no output
+artifacts.
+
+Bundle promotion and post-H lifecycle persistence are separate commits; no session writer lock is
+held while evaluation runs. A crash between them can leave a complete but unreferenced bundle. If
+the session still ends at H, retry safely revalidates and binds identical bytes. If another writer
+advanced the session, the expected-head append fails and the old bundle remains unreferenced for
+manual audit; it is never folded into the newer head automatically. A crash between lifecycle
+segment and head replacement produces the detectable head-mismatch state described above.
+
+Session verification also validates each complete invocation lifecycle, not only individual event
+schemas: validated request -> resolved input -> result -> exact output references -> exact ordered
+warnings/errors. Attempts must be consecutive per request identity, and every causal parent must
+match. Partial, orphaned, reordered, or cross-bound tool events fail before persistence or during
+verification.
+
 Credential screening rejects credential-bearing metadata field names, private-key headers, and
 known GitHub/OpenAI/AWS token forms. It deliberately does not use entropy heuristics, so hashes,
 symbols, identifiers, and legitimate research prose remain valid. This is defense in depth, not
@@ -227,6 +281,12 @@ CLI exit behavior is:
   operational failure;
 - `2`: malformed request/specification, unsupported tool/version, or unsafe user path.
 
+For checkpoint-2 evaluation commands, `0` also includes every valid critic outcome:
+`needs_data`, `rejected`, `provisional`, and `accepted_for_further_testing`, including a preserved
+researcher selection that is more permissive than the gates. Integrity, persistence, and runtime
+failures return `1`. Malformed contracts, unsupported policy/schema versions, unsafe paths, and
+conflicting output return `2`. A negative research decision is not a process failure.
+
 ## CLI
 
 ```text
@@ -239,19 +299,30 @@ wpr research session append --session work/session --event critique.json
 wpr research session inspect --session work/session
 wpr research session verify --session work/session
 wpr research session export --session work/session --output outputs/session.json
+
+wpr research session evaluate \
+  --session work/session \
+  --request evaluation-request.json \
+  --output outputs/evaluation
+wpr research evaluation verify \
+  --input outputs/evaluation \
+  --session work/session
 ```
 
-All command output is stable JSON. CLI paths are operational display values and are not inserted
-into portable analytical identities.
+All command output is stable JSON. Absolute CLI display paths are out-of-band, but safe relative
+paths persisted in requests and artifact references do affect nominal request and session
+analytical identities. The evaluation output-directory name is excluded only from the separate
+portable evaluation identity.
 
 ## Future Funding Agent and Market Agent
 
 A future Funding Agent may choose a narrow funding/study tool, inspect explicit completeness and
-metric warnings, request another deterministic study, and cite artifact hashes. A future Market
-Agent may inspect registered price/market tools once those tools have equally strict artifact
-contracts. Neither agent may calculate funding, transform data, run SQL, reconstruct P&L, or invent
-provenance in model text.
+metric warnings, request another deterministic study, cite its exact evidence, and submit it to the
+critic. A future Market Agent may inspect registered price/market tools once those tools have
+equally strict artifact contracts and an explicitly versioned evaluation policy. Neither agent may
+calculate funding, transform data, run SQL, reconstruct P&L, invent provenance, or bypass a failed
+gate in model text.
 
-Deferred work includes critic/evaluation contracts, an LLM-backed orchestrator, standalone
-funding/price tools, deterministic strategy benchmarks, scheduling, distributed workers, vector
-databases, new exchanges, authenticated trading, and portfolio accounting.
+Deferred work includes an LLM-backed orchestrator, standalone funding/price tools, deterministic strategy benchmarks,
+scheduling, distributed workers, vector databases, new exchanges, authenticated trading, and
+portfolio accounting.

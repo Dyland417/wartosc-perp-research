@@ -400,7 +400,9 @@ and failures cannot expose a partial complete-looking bundle.
 - Artifact-backed sessions store bounded structured evidence in atomic append-only event segments.
 - A full hash chain detects persisted mutation, deletion, reorder, causal-reference corruption,
   and partial files; a committed-head document also detects tail deletion, while a separate
-  clock-free analytical chain supports deterministic portable export.
+  analytical chain omits each event's direct recorded timestamp. Cross-run evaluation identity is
+  a separate portable projection because later analytical payloads may bind exact operational
+  evidence identities.
 - Identical requests against identical resolved source bytes are idempotent. Changed source bytes
   create a new attempt and never overwrite earlier evidence silently.
 - SQLite runs hold a reserved writer barrier from source hashing through all analytical reads, so
@@ -413,6 +415,74 @@ and failures cannot expose a partial complete-looking bundle.
 
 See `docs/research-tools-and-sessions.md` for schemas, failure categories, trust boundaries, and
 the lifecycle intended for future Funding and Market agents.
+
+### Phase 5 - Deterministic critic and evaluation boundary (checkpoint 2)
+
+Checkpoint 2 consumes completed checkpoint-1 evidence and expands the closed catalog to `1.1.0`
+with exactly two schema-v1 adapters: `research_session.evaluate` and
+`research_evaluation.verify`. Generic rule execution and arbitrary artifact querying remain
+forbidden.
+
+```text
+fully verified current session chain
+              |
+              v
+declared immutable prefix H
+              |
+              v
+closed critic policy + exact citation resolution
+              |
+              v
+typed findings -> ordered gates -> bounded decision status
+              |
+              v
+transactional deterministic evaluation bundle
+```
+
+- The only policy is `wartosc.historical-study-sufficiency/1.0.0`; it is compiled into the
+  package and cannot contain executable expressions, SQL, dynamic imports, or user-supplied rule
+  logic.
+- A target binds session ID, immutable header hash, positive event count, full event-chain head,
+  and analytical-chain head. The full current chain is verified before events `1..H` are exposed
+  to the evaluator.
+- Citations bind the exact prefix, event sequence and hashes, tool attempt and identities, and,
+  for historical-study JSON, immutable artifact path/hash/schema plus a constrained scalar JSON
+  Pointer. Verification repeats resolution against the source session and closed study bundle.
+- Multiple studies require one explicit selected tool-result citation. A later attempt for the
+  same request with changed resolved input supersedes the older attempt within the assessed prefix;
+  no heuristic chooses a replacement.
+- The critic compares only a closed structured-claim vocabulary. Free-form conclusions are
+  retained as researcher evidence, but their semantic truth is explicitly unverified.
+- Warnings retain source, content hash, policy classification, disposition, and resolution
+  citations. Unknown, unacknowledged, or falsely resolved warnings fail closed under policy v1;
+  unavailable metrics remain unavailable rather than becoming zero.
+- Typed findings, ordered gates, and independent policy ceilings yield one of `needs_data`,
+  `rejected`, `provisional`, or `accepted_for_further_testing`. Researchers may choose a more
+  conservative status, never a more
+  permissive effective status. The typed `effective_status` is authoritative and falls back to the
+  critic recommendation whenever the researcher decision is invalid or impermissible.
+- The closed four-file bundle is canonical, adds no evaluation-generation timestamp, is manifest-hashed,
+  transactionally promoted, overwrite-protected, idempotent, and fully re-verifiable.
+- First invocation requires the request to freeze the current pre-invocation head H. The bundle is
+  evaluated and written against H, then the ordinary allowlisted tool lifecycle records its request,
+  result, and immutable outputs after H. Those later events cannot enter the evaluation. Identical
+  retries append nothing; assessing a newer head requires a distinct request and output.
+- Bundle promotion and post-H lifecycle recording are separate fail-closed commits. Interruption can
+  leave an unreferenced complete bundle; stale writers cannot attach it after another session append,
+  and segment/head split failures require manual recovery rather than inferred intent.
+- Session verification enforces each whole tool lifecycle and causal binding in addition to event
+  hashes and payload schemas, so orphaned, partial, reordered, or mismatched result/artifact/
+  diagnostic events fail closed.
+- The critic does not establish profitability, prove natural-language claims, authorize live
+  trading, or replace human research judgment. There is still no LLM or autonomous agent.
+
+Exit criterion: complete, incomplete, failed, superseded, contradictory, warning-limited, and
+tampered fixtures resolve deterministically; a later append cannot alter an earlier evaluation;
+identical inputs are byte-identical; every bundle hash and citation re-verifies; and unsafe or
+interrupted writes never expose a valid-looking partial bundle.
+
+See `docs/research-evaluations.md` for the exact contracts, policy rules, finding taxonomy, gate
+table, decision permissions, CLI, and interpretation boundary.
 
 ### Later phase - Basis and microstructure
 

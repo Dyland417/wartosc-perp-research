@@ -57,11 +57,15 @@ from wartosc_perp_research.research import (
 from wartosc_perp_research.research_tools import (
     DEFAULT_REGISTRY,
     TOOL_CATALOG_VERSION,
+    EvaluationContractError,
+    ResearchEvaluationConflictError,
+    ResearchEvaluationPathError,
     ResearchSessionConflictError,
     ResearchSessionError,
     ResearchSessionIntegrityError,
     SafeToolPathError,
     ToolContractError,
+    ToolRequest,
     append_researcher_event,
     create_research_session,
     export_research_session,
@@ -282,6 +286,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     session_export.add_argument("--session", type=Path, required=True)
     session_export.add_argument("--output", type=Path, required=True)
+    session_evaluate = research_session_commands.add_parser(
+        "evaluate", help="Evaluate one exact immutable session prefix"
+    )
+    session_evaluate.add_argument("--session", type=Path, required=True)
+    session_evaluate.add_argument("--request", type=Path, required=True)
+    session_evaluate.add_argument("--output", type=Path, required=True)
+
+    research_evaluation = research_commands.add_parser(
+        "evaluation", help="Verify deterministic research-evaluation artifacts"
+    )
+    research_evaluation_commands = research_evaluation.add_subparsers(
+        dest="research_evaluation_command", required=True
+    )
+    evaluation_verify = research_evaluation_commands.add_parser(
+        "verify", help="Verify an evaluation bundle and re-resolve its cited session evidence"
+    )
+    evaluation_verify.add_argument("--input", type=Path, required=True)
+    evaluation_verify.add_argument("--session", type=Path, required=True)
 
     backtest = commands.add_parser(
         "backtest", help="Run explicit deterministic accounting simulations"
@@ -898,6 +920,32 @@ def _run_research_tools(args: argparse.Namespace) -> dict[str, Any]:
         raise ResearchRequestError(str(exc)) from exc
 
 
+def _session_relative_path(session: Path, path: Path, field_name: str) -> str:
+    root = Path(session).expanduser().absolute().parent
+    candidate = Path(path).expanduser().absolute()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ResearchRequestError(
+            f"Evaluation {field_name} must be inside the research root containing the session"
+        ) from exc
+    if candidate == root:
+        raise ResearchRequestError(f"Evaluation {field_name} must not be the research root")
+    return relative.as_posix()
+
+
+def _raise_invalid_tool_failure(result: Any) -> None:
+    if result.status.value != "failed" or not result.errors:
+        return
+    error = result.errors[0]
+    if error.category.value in {
+        "invalid_request",
+        "unsafe_path_or_output_conflict",
+        "unsupported_tool_or_schema_version",
+    }:
+        raise ResearchRequestError(error.message)
+
+
 def _run_research_session(args: argparse.Namespace) -> dict[str, Any]:
     try:
         command = args.research_session_command
@@ -920,6 +968,35 @@ def _run_research_session(args: argparse.Namespace) -> dict[str, Any]:
         if command == "verify":
             snapshot = verify_research_session(args.session, verify_artifacts=True)
             return {"status": "verified", "summary": session_summary(snapshot)}
+        if command == "evaluate":
+            receipt = invoke_research_tool(
+                args.session,
+                ToolRequest(
+                    tool_name="research_session.evaluate",
+                    schema_version=1,
+                    arguments={
+                        "output": _session_relative_path(args.session, args.output, "output"),
+                        "request": _session_relative_path(args.session, args.request, "request"),
+                    },
+                ),
+            )
+            _raise_invalid_tool_failure(receipt.result)
+            if receipt.result.status.value == "failed":
+                return {"status": "failed", **receipt.to_dict()}
+            evidence = receipt.result.evidence
+            return {
+                "critic_recommended_status": evidence["critic_recommended_status"],
+                "effective_status": evidence["effective_status"],
+                "idempotent": bool(receipt.output_reused),
+                "output": str(args.output),
+                "portable_evaluation_identity_sha256": (
+                    receipt.result.portable_analytical_identity_sha256
+                ),
+                "researcher_selected_status": evidence["researcher_selected_status"],
+                "researcher_status_permitted": evidence["researcher_status_permitted"],
+                "session_idempotent_retry": receipt.idempotent_retry,
+                "status": "complete",
+            }
         output, digest = export_research_session(args.session, args.output)
         return {
             "output": str(output),
@@ -930,10 +1007,37 @@ def _run_research_session(args: argparse.Namespace) -> dict[str, Any]:
         raise
     except (
         ResearchSessionError,
+        EvaluationContractError,
+        ResearchEvaluationConflictError,
+        ResearchEvaluationPathError,
         SafeToolPathError,
         ToolContractError,
     ) as exc:
         raise ResearchRequestError(str(exc)) from exc
+
+
+def _run_research_evaluation(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        receipt = invoke_research_tool(
+            args.session,
+            ToolRequest(
+                tool_name="research_evaluation.verify",
+                schema_version=1,
+                arguments={"bundle": _session_relative_path(args.session, args.input, "bundle")},
+            ),
+        )
+        _raise_invalid_tool_failure(receipt.result)
+    except (EvaluationContractError, ResearchEvaluationPathError, ToolContractError) as exc:
+        raise ResearchRequestError(str(exc)) from exc
+    if receipt.result.status.value == "failed":
+        return {"status": "failed", **receipt.to_dict()}
+    return {
+        "critic_recommended_status": receipt.result.evidence["critic_recommended_status"],
+        "effective_status": receipt.result.evidence["effective_status"],
+        "idempotent_retry": receipt.idempotent_retry,
+        "portable_evaluation_identity_sha256": (receipt.result.portable_analytical_identity_sha256),
+        "status": "verified",
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -950,6 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
             output = _run_research_tools(args)
         elif args.command == "research" and args.research_command == "session":
             output = _run_research_session(args)
+        elif args.command == "research" and args.research_command == "evaluation":
+            output = _run_research_evaluation(args)
         else:
             settings = load_settings(args.config)
             if args.command == "db":
@@ -977,11 +1083,6 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "error", "error": str(exc)}), file=sys.stderr)
         return 1
     print(json.dumps(output, sort_keys=True))
-    if (
-        args.command == "research"
-        and args.research_command == "session"
-        and args.research_session_command == "invoke"
-        and output["status"] == "failed"
-    ):
+    if args.command == "research" and output["status"] == "failed":
         return 1
     return 0
