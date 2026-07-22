@@ -58,6 +58,15 @@ then records the ordinary request/result/output lifecycle after that head; it ca
 own events. It does not prove free-form conclusions, establish profitability, or authorize live
 trading.
 
+Phase 5 checkpoint 3A adds four closed, versioned baseline target-position generators:
+`flat_control`, `static_long`, `static_short`, and `lagged_funding_receiver`. They produce native
+schema-v1 schedules and a deterministic five-file evidence bundle. Funding-driven decisions use
+actual hourly exchange-event observations, begin flat, fail on incomplete evidence, and can act
+only at the first declared native decision boundary at or after exact event-time information
+availability. Logical hourly slots remain separate coverage identities and never replace exchange
+timestamps. These are research controls, not executable strategies, rankings, or evidence of
+profitability. Registry/session exposure and comparative benchmark orchestration remain deferred.
+
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
 ## Architecture
@@ -97,6 +106,8 @@ See [docs/research-tools-and-sessions.md](docs/research-tools-and-sessions.md) f
 tool registry, session lifecycle, trust boundaries, hash chains, and retry behavior.
 See [docs/research-evaluations.md](docs/research-evaluations.md) for the deterministic critic
 policy, citation contract, frozen-prefix semantics, gates, statuses, and evaluation artifacts.
+See [docs/research-baselines.md](docs/research-baselines.md) for the closed baseline catalog,
+funding timing, provenance identities, bundle authority, and interpretation limits.
 
 ## Repository layout
 
@@ -115,6 +126,8 @@ src/wartosc_perp_research/
   research/funding_report.py           deterministic JSON and Markdown reports
   research/price_repository.py         point-in-time completed-candle queries
   research/price_export.py             deterministic price exports and coverage manifests
+  research/baselines.py                strict baseline contracts, generators, bundles, verifier
+  research/baseline_repository.py      actual-funding evidence reads with ingestion lineage
   backtests/engine.py                   event clock and Decimal position/cash ledger
   backtests/scenario.py                 strict versioned JSON scenario loading
   backtests/report.py                   deterministic simulation reports and manifests
@@ -134,6 +147,40 @@ src/wartosc_perp_research/
   strategies/                          future execution-independent signals
 tests/                                  foundation tests
 ```
+
+## Deterministic research baselines
+
+Create a strict JSON specification and generate a bundle. Only the funding receiver accepts and
+requires a database; flat and static controls reject `--database` because they consume no market
+evidence.
+
+```text
+wpr research baseline generate --database work/research.db \
+  --spec baseline-spec.json --output outputs/baseline
+wpr research baseline verify --input outputs/baseline
+```
+
+The output contains `baseline-spec.json`, `target-schedule.json`, `decision-evidence.json`,
+`report.md`, and `manifest.json`. Repeating identical inputs reuses identical bytes; different or
+unsafe existing output is never overwritten. Invalid requests exit `2`. A valid funding request
+with missing or invalid evidence reports `needs_data`, exits `1`, and writes no schedule.
+
+`target-schedule.json` is accepted unchanged by the existing schedule parser, assembler, and
+historical-study pipeline. It contains target decisions only: fills, candle prices, latency,
+spread, slippage, fees, and marking remain explicit downstream assumptions. Full independent
+attestation that a historical study was regenerated from a particular baseline evidence bundle is
+deferred to checkpoint 3B; the current study hashes the exact schedule document, whose intent notes
+retain the baseline analytical and source identities.
+
+For funding-driven decisions, the bundle records four distinct times: the original exchange event
+time, its logical hourly coverage slot, the information-availability time (equal to the unmodified
+event time in policy v1), and the generated target-decision time. The decision time is the first
+declared schedule-grid boundary at or after information availability. Thus an explicit `1h`
+decision interval delays an event at `00:00:00.500Z` to `01:00:00Z`; a finer declared interval uses
+its earlier eligible boundary. This is a modeled scheduling convention, not timestamp correction.
+At exactly equal timestamps the downstream order is funding, fill, mark, so a newly opened position
+cannot receive the funding just observed. A zero-latency candle-open fill is a deterministic proxy,
+not proof that a post-settlement market execution was available.
 
 ## Setup
 

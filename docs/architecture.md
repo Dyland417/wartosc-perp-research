@@ -69,6 +69,22 @@ cash accounting, price P&L, funding cash flows, fees, and slippage attribution f
 A later strategy engine will own signal scheduling, fill generation, margin, liquidation, and
 capacity. The descriptive funding study remains explicitly separate from simulation.
 
+Phase 5 checkpoint 3A introduces a narrower precursor to a general strategy layer: four closed,
+versioned baseline policies compile supplied parameters and, for one policy, complete actual
+hourly funding evidence into the existing native position-schedule schema. The baseline module
+does not assemble fills, run accounting, calculate metrics, rank outcomes, or enter the trusted
+research-tool registry. Its bundle verifier regenerates schedules from portable evidence, while
+the downstream historical study binds the exact schedule document. Independent baseline-origin
+attestation and registry/session integration remain a checkpoint 3B boundary.
+
+For the funding policy, exchange event time is the exact policy-v1 information-availability time.
+The logical hourly slot is a separate derived identity used only for coverage, duplicate/conflict
+detection, and grid validation. The generated target time is the first declared schedule-grid
+boundary at or after information availability, and the assembler separately applies latency to
+choose an eligible candle-open proxy. No timestamp is rounded backward. Equal-timestamp eligibility
+is explicitly modeled—not evidence of a post-settlement executable price—and accounting still
+orders funding before fill before mark.
+
 ## Missing components
 
 Phase 1 deliberately leaves these unimplemented:

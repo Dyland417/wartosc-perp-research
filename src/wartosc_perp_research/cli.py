@@ -54,6 +54,15 @@ from wartosc_perp_research.research import (
     write_funding_report,
     write_price_export,
 )
+from wartosc_perp_research.research.baseline_repository import load_baseline_funding_evidence
+from wartosc_perp_research.research.baselines import (
+    BaselineError,
+    BaselineNeedsDataError,
+    generate_baseline,
+    load_baseline_bundle,
+    load_baseline_specification,
+    write_baseline_bundle,
+)
 from wartosc_perp_research.research_tools import (
     DEFAULT_REGISTRY,
     TOOL_CATALOG_VERSION,
@@ -238,6 +247,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace existing alignment files when their contents differ",
     )
+
+    research_baseline = research_commands.add_parser(
+        "baseline", help="Generate or verify deterministic baseline target schedules"
+    )
+    baseline_commands = research_baseline.add_subparsers(
+        dest="research_baseline_command", required=True
+    )
+    baseline_generate = baseline_commands.add_parser(
+        "generate", help="Generate a canonical baseline bundle from a strict specification"
+    )
+    baseline_generate.add_argument("--spec", type=Path, required=True)
+    baseline_generate.add_argument("--output", type=Path, required=True)
+    baseline_generate.add_argument(
+        "--database", type=Path, help="SQLite database; required only for funding receiver"
+    )
+    baseline_verify = baseline_commands.add_parser(
+        "verify", help="Recompute and verify a canonical baseline bundle"
+    )
+    baseline_verify.add_argument("--input", type=Path, required=True)
 
     research_tools = research_commands.add_parser(
         "tools", help="Discover the closed deterministic research-tool catalog"
@@ -804,6 +832,68 @@ def _run_funding_oracle_research(args: argparse.Namespace, settings: Settings) -
     }
 
 
+def _run_baseline_research(args: argparse.Namespace) -> dict[str, Any]:
+    """Generate or independently verify a deterministic baseline artifact bundle."""
+
+    if args.research_baseline_command == "verify":
+        try:
+            bundle = load_baseline_bundle(args.input)
+        except (BaselineError, TypeError, ValueError) as exc:
+            raise ResearchRequestError(str(exc)) from exc
+        return {
+            "status": "verified",
+            "baseline_name": bundle.manifest["baseline_name"],
+            "analytical_identity_sha256": bundle.manifest["analytical_identity_sha256"],
+            "input": str(args.input),
+        }
+
+    database: Database | None = None
+    try:
+        specification = load_baseline_specification(args.spec)
+        if specification.baseline_name == "lagged_funding_receiver":
+            if args.database is None:
+                raise ResearchRequestError("--database is required for lagged_funding_receiver")
+            database = _database_from_file(args.database)
+            evidence = load_baseline_funding_evidence(
+                database,
+                exchange=specification.exchange,
+                instrument=specification.instrument,
+                start=specification.study_start,
+                end=specification.study_end,
+            )
+        else:
+            if args.database is not None:
+                raise ResearchRequestError(
+                    "--database is forbidden for flat and static control baselines"
+                )
+            evidence = ()
+        result = generate_baseline(specification, evidence)
+        paths = write_baseline_bundle(result, args.output)
+    except ResearchRequestError:
+        raise
+    except BaselineNeedsDataError:
+        raise
+    except (BaselineError, TypeError, ValueError) as exc:
+        raise ResearchRequestError(str(exc)) from exc
+    finally:
+        if database is not None:
+            database.dispose()
+    return {
+        "status": "complete",
+        "study_type": "deterministic_baseline_target_schedule",
+        "baseline_name": specification.baseline_name,
+        "baseline_version": specification.baseline_version,
+        "exchange": specification.exchange,
+        "symbol": specification.instrument,
+        "target_change_count": len(result.schedule.intents),
+        "funding_evidence_count": len(result.evidence),
+        "analytical_identity_sha256": result.analytical_identity_sha256,
+        "target_schedule_json": str(paths.target_schedule_json),
+        "manifest_json": str(paths.manifest_json),
+        "report_markdown": str(paths.report_markdown),
+    }
+
+
 def _run_backtest_scenario(args: argparse.Namespace) -> dict[str, Any]:
     try:
         scenario = load_backtest_scenario(args.input)
@@ -1056,6 +1146,8 @@ def main(argv: list[str] | None = None) -> int:
             output = _run_research_session(args)
         elif args.command == "research" and args.research_command == "evaluation":
             output = _run_research_evaluation(args)
+        elif args.command == "research" and args.research_command == "baseline":
+            output = _run_baseline_research(args)
         else:
             settings = load_settings(args.config)
             if args.command == "db":
@@ -1079,6 +1171,9 @@ def main(argv: list[str] | None = None) -> int:
     except ResearchRequestError as exc:
         print(json.dumps({"status": "invalid_request", "error": str(exc)}), file=sys.stderr)
         return 2
+    except BaselineNeedsDataError as exc:
+        print(json.dumps({"status": "needs_data", "error": str(exc)}), file=sys.stderr)
+        return 1
     except Exception as exc:
         print(json.dumps({"status": "error", "error": str(exc)}), file=sys.stderr)
         return 1
