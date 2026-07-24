@@ -87,10 +87,13 @@ from .report import (
 )
 from .scenario import load_backtest_scenario
 from .study import (
+    BaselineScheduleProvenance,
     HistoricalStudyResult,
     HistoricalStudySpecification,
     HistoricalStudySpecificationError,
     analytical_study_identity_document,
+    baseline_schedule_provenance_from_dict,
+    baseline_schedule_provenance_to_dict,
     historical_study_specification_from_dict,
     historical_study_specification_to_dict,
     load_historical_study_specification,
@@ -119,6 +122,7 @@ __all__ = [
     "BacktestReportPaths",
     "BacktestResult",
     "BacktestScenario",
+    "BaselineScheduleProvenance",
     "CagrMetrics",
     "CagrToMaxDrawdownMetrics",
     "CurveMetadata",
@@ -170,6 +174,8 @@ __all__ = [
     "backtest_result_to_dict",
     "backtest_scenario_to_dict",
     "analytical_study_identity_document",
+    "baseline_schedule_provenance_from_dict",
+    "baseline_schedule_provenance_to_dict",
     "assemble_scenario",
     "assemble_scenario_from_database",
     "build_event_equity_curve",

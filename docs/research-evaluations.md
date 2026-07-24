@@ -129,13 +129,14 @@ Every citation binds to the request's session and analytical prefix and includes
 - `tool`, where required;
 - `artifact`, where required.
 
-The three source types are:
+The four source types are:
 
 | Source type | Additional contract |
 | --- | --- |
 | `session_event` | No tool or artifact locator. The event itself is the cited evidence. |
 | `tool_result` | Exact tool name/schema, attempt, request identity, resolved-input identity, and portable analytical identity. The event must be `tool_execution_result`. |
 | `historical_study_json` | The same exact tool identity plus one immutable artifact locator and constrained JSON Pointer. |
+| `research_baseline_json` | The same exact tool identity plus one immutable generated-baseline artifact locator and constrained JSON Pointer. |
 
 An artifact locator contains a portable logical path under the session's parent research root, its
 SHA-256, an allowlisted schema identifier/version, and a JSON Pointer. Policy v1 accepts only:
@@ -148,6 +149,15 @@ SHA-256, an allowlisted schema identifier/version, and a JSON Pointer. Policy v1
 | `historical_study.accounting` | `accounting.json` | 1 |
 | `historical_study.metrics` | `metrics.json` | 1 |
 | `historical_study.manifest` | `manifest.json` | 1 |
+| `research_baseline.specification` | `baseline-spec.json` | 1 |
+| `research_baseline.target_schedule` | `target-schedule.json` | 1 |
+| `research_baseline.decision_evidence` | `decision-evidence.json` | 1 |
+| `research_baseline.manifest` | `manifest.json` | 1 |
+
+Baseline citations are intentionally closed to these four canonical JSON schemas. The Markdown
+report, arbitrary JSON documents, generic JSON Pointer authority, filesystem paths, and free-form
+prose are not accepted. The cited generated artifact and its tool-result event must already be
+inside the frozen session prefix.
 
 JSON Pointers use a bounded RFC 6901 subset: an absolute pointer, at most 512 UTF-8 bytes and 16
 nonempty segments, canonical decimal array indexes, and only `~0` and `~1` escapes. Wildcards,

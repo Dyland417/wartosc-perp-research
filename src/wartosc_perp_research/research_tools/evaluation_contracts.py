@@ -28,6 +28,10 @@ POLICY_VERSION = "1.0.0"
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _JSON_POINTER_INDEX = re.compile(r"0|[1-9][0-9]*\Z")
 _SUPPORTED_ARTIFACT_SCHEMAS = {
+    "research_baseline.decision_evidence": ("decision-evidence.json", 1),
+    "research_baseline.manifest": ("manifest.json", 1),
+    "research_baseline.specification": ("baseline-spec.json", 1),
+    "research_baseline.target_schedule": ("target-schedule.json", 1),
     "historical_study.accounting": ("accounting.json", 1),
     "historical_study.assembly": ("assembly.json", 1),
     "historical_study.manifest": ("manifest.json", 1),
@@ -45,6 +49,7 @@ class CitationSource(StrEnum):
     SESSION_EVENT = "session_event"
     TOOL_RESULT = "tool_result"
     HISTORICAL_STUDY_JSON = "historical_study_json"
+    RESEARCH_BASELINE_JSON = "research_baseline_json"
 
 
 class ClaimType(StrEnum):
@@ -376,7 +381,17 @@ class EvidenceCitation:
                 raise EvaluationContractError("Tool-result citations require only a tool identity")
         elif self.tool is None or self.artifact is None:
             raise EvaluationContractError(
-                "Historical-study JSON citations require tool and artifact data"
+                "Closed-bundle JSON citations require tool and artifact data"
+            )
+        elif (
+            self.source_type is CitationSource.HISTORICAL_STUDY_JSON
+            and not self.artifact.schema_id.startswith("historical_study.")
+        ) or (
+            self.source_type is CitationSource.RESEARCH_BASELINE_JSON
+            and not self.artifact.schema_id.startswith("research_baseline.")
+        ):
+            raise EvaluationContractError(
+                "Citation source type does not match the closed artifact schema"
             )
 
     def to_dict(self) -> dict[str, Any]:

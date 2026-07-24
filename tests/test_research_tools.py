@@ -297,6 +297,8 @@ def test_tool_catalog_is_closed_versioned_and_describable(tmp_path: Path) -> Non
     assert [(item["name"], item["schema_version"]) for item in listing] == [
         ("historical_study.run", 1),
         ("historical_study.verify", 1),
+        ("research_baseline.generate", 1),
+        ("research_baseline.verify", 1),
         ("research_evaluation.verify", 1),
         ("research_session.evaluate", 1),
     ]
@@ -1114,7 +1116,7 @@ def test_cli_discovery_session_vertical_and_exit_codes(
 ) -> None:
     assert cli.main(["research", "tools", "list"]) == 0
     catalog = json.loads(capsys.readouterr().out)
-    assert len(catalog["tools"]) == 4
+    assert len(catalog["tools"]) == 6
     assert cli.main(["research", "tools", "describe", "historical_study.run"]) == 0
     assert json.loads(capsys.readouterr().out)["tool"]["versions"][0]["schema_version"] == 1
     session_spec = research_root / "session-spec.json"

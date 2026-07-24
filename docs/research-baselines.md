@@ -1,8 +1,9 @@
 # Deterministic research baselines
 
-Phase 5 checkpoint 3A is a closed schedule-generation layer between curated evidence and the
-existing scenario assembler. It creates deterministic research controls; it is not an execution
-system, a generic strategy language, a ranking engine, or approval for live trading.
+Phase 5 checkpoints 3A and 3B form a closed schedule-generation and source-attestation layer
+between curated evidence and the existing scenario assembler. They create deterministic research
+controls; they are not an execution system, a generic strategy language, a ranking engine, or
+approval for live trading.
 
 ## Closed catalog and specification
 
@@ -94,18 +95,42 @@ unsafe path states.
 The target schedule is the canonical existing schema v1 and needs no translation. The assembler
 continues to own latency and modeled fills; accounting owns P&L; metrics own performance results;
 the critic evaluates the resulting study. Intent notes retain the full baseline analytical and
-source identities, and the historical study hashes the exact schedule document including those
-notes. This proves which schedule the study consumed. It does not independently prove that the
-schedule was faithfully regenerated from the baseline bundle; adding that origin attestation and
-closed registry/session exposure is checkpoint 3B work. Researcher-supplied schema-v1 schedules
-remain valid and do not need baseline metadata.
+source identities. Researcher-supplied schema-v1 studies without baseline metadata remain valid,
+and their parse/serialize representation is unchanged.
 
-The baseline verifier proves internal bundle consistency and deterministic regeneration from the
-bundled specification and evidence. SHA-256 proves byte identity and integrity, not signer
-authenticity or database authorship. An internally self-consistent rewritten bundle is not
-independent source-origin attestation. The database reader supplies the evidence during generation,
-but the standalone verifier intentionally does not reopen a mutable database and make a stronger
-claim.
+The standalone baseline verifier proves internal bundle consistency and deterministic regeneration
+from bundled specification and evidence. A self-consistent rewrite can therefore pass that
+internal check. The registered `research_baseline.generate` and `research_baseline.verify` tools
+add a separate origin policy. For `lagged_funding_receiver`, they require an authoritative database,
+reject active SQLite journal/WAL sidecars, acquire a consistent-read barrier, hash the database,
+resolve actual funding and ingestion lineage, regenerate the complete bundle, and confirm the
+database bytes remain unchanged. Changed rows, duplicate/conflicting slots, predicted funding,
+unsupported ingestion lineage, a stale operational snapshot, or any nonreproducible byte fails
+origin attestation. Flat and static controls reject any database argument and explicitly report
+`database_consulted: false`; their authority is only the versioned policy and specification.
+SQLite databases configured for WAL journal mode are currently unsupported because acquiring the
+barrier can itself materialize WAL/SHM sidecars; callers must checkpoint and convert them to a
+sidecar-free rollback-journal snapshot before attestation.
+
+Three identities must not be conflated:
+
+- portable market-data identity hashes economic funding observations without local IDs or clocks;
+- portable source-lineage identity hashes the recorded ingestion-run descriptors;
+- operational database-snapshot identity hashes the exact SQLite main-file bytes used under the
+  read barrier.
+
+An optional typed provenance extension links an attested baseline to a historical study. When it is
+present, `historical_study.run` requires the supplied closed bundle to pass internal and origin
+verification, requires byte-identical canonical schedule content, and requires complete binding of
+the specification, schedule, evidence, report, manifest, bundle, and attestation identities. The
+typed link carries a separate SHA-256 for each of the five artifacts, including
+`baseline_report_sha256`; no partial provenance or schedule substitution is accepted.
+
+SHA-256 proves byte identity and corruption resistance, not signer authenticity or database
+authorship. The current normalized schema records ingestion-run descriptors but does not link each
+funding row to an immutable raw-archive object. A party able to replace the database and all
+artifacts can still construct a different unsigned history; signed source provenance remains
+outside this checkpoint.
 
 ## Interpretation limits
 
@@ -116,6 +141,6 @@ guaranteed executable prices. Fees, spread, slippage, latency, marking, and all 
 remain supplied or calculated by the existing study layers. Short samples and incomplete coverage
 limit interpretation. These baselines establish neither profitability nor live tradability.
 
-Deferred work includes comparative multi-baseline execution, parameter selection, registry/session
-exposure, broader deterministic funding/price tools, portfolios, optimization, significance tests,
+Deferred work includes comparative multi-baseline execution, parameter selection and ranking,
+broader deterministic funding/price tools, portfolios, optimization, significance tests,
 walk-forward selection, execution, scheduling, additional venues, and LLM orchestration.

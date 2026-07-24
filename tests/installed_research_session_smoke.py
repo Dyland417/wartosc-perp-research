@@ -40,9 +40,9 @@ def _write_json(path: Path, value: object) -> None:
 
 def _evaluation_request(session: Path) -> EvaluationRequest:
     snapshot = verify_research_session(session, verify_artifacts=True)
-    result_event = next(
+    result_event = [
         event for event in snapshot.events if event["event_type"] == "tool_execution_result"
-    )
+    ][-1]
     decision_event = snapshot.events[-1]
     assert decision_event["event_type"] == "researcher_decision"
     result = ToolResult.from_dict(result_event["analytical"]["result"])

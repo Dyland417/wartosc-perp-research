@@ -73,9 +73,16 @@ Phase 5 checkpoint 3A introduces a narrower precursor to a general strategy laye
 versioned baseline policies compile supplied parameters and, for one policy, complete actual
 hourly funding evidence into the existing native position-schedule schema. The baseline module
 does not assemble fills, run accounting, calculate metrics, rank outcomes, or enter the trusted
-research-tool registry. Its bundle verifier regenerates schedules from portable evidence, while
-the downstream historical study binds the exact schedule document. Independent baseline-origin
-attestation and registry/session integration remain a checkpoint 3B boundary.
+research-tool registry. Its bundle verifier regenerates schedules from portable evidence.
+
+Checkpoint 3B registers only baseline generation and verification, independently attests funding
+origin by requerying authoritative normalized rows under a consistent SQLite read boundary, and
+adds an optional typed provenance extension to schema-v1 historical studies. A provenance-bearing
+study must supply the closed baseline bundle, use its canonical schedule byte-for-byte, and bind all
+five artifact hashes plus the portable attestation identity. Existing studies without provenance
+parse and serialize unchanged. Portable market-content, portable ingestion-lineage, and operational
+database-byte identities are intentionally different claims; no local row ID, path, or clock enters
+the first two.
 
 For the funding policy, exchange event time is the exact policy-v1 information-availability time.
 The logical hourly slot is a separate derived identity used only for coverage, duplicate/conflict

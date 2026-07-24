@@ -10,6 +10,10 @@ of this evidence. It narrowly extends the same closed registry with two evaluati
 session verification enforce the already-written canonical tool lifecycle. See
 `docs/research-evaluations.md` for its exact citation, policy, finding, gate, and artifact schemas.
 
+Phase 5 checkpoint 3B adds two baseline tools and an optional provenance link from a verified
+baseline schedule into a historical study. It does not add a comparison, ranking, optimization, or
+autonomous orchestration loop.
+
 ```text
 research objective
         |
@@ -31,9 +35,8 @@ dependency, and no prompt loop is executed or persisted.
 
 ## Initial tool catalog
 
-The catalog is versioned `1.1.0`. Every tool independently has a positive integer schema version.
-Checkpoint 1 exposed two historical-study tools; checkpoint 2 adds exactly two narrow evaluation
-tools.
+The catalog is versioned `1.2.0`. Every tool independently has a positive integer schema version.
+It contains exactly two historical-study tools, two evaluation tools, and two baseline tools.
 
 | Tool | Authoritative implementation | Why it is exposed |
 | --- | --- | --- |
@@ -41,6 +44,8 @@ tools.
 | `historical_study.verify` | `backtests.load_historical_study_bundle` | The canonical bundle already has a closed artifact set, strict schemas, content hashes, analytical identities, and dependency-graph validation. |
 | `research_session.evaluate` | `research_tools.evaluate_research_session` | The adapter evaluates only the request's exact pre-invocation prefix, writes the closed bundle, and records its immutable outputs after that prefix. |
 | `research_evaluation.verify` | `research_tools.verify_research_evaluation` | The adapter re-resolves a closed evaluation bundle against its source session and records a read-only verification result. |
+| `research_baseline.generate` | `research.generate_baseline`, bundle writer, and independent origin attestation | The adapter creates one policy-v1 closed baseline bundle and proves its schedule against either the versioned control policy or an authoritative funding database. |
+| `research_baseline.verify` | closed baseline loader plus independent origin attestation | The adapter separates internal bundle verification from a fresh policy/database origin check and produces no output artifact. |
 
 Funding coverage, price coverage, scenario assembly, scenario accounting, and standalone metrics
 remain deterministic internal/application capabilities. They are not yet registered tools because
@@ -50,10 +55,9 @@ portable verification contract. The registry does not automatically expose Pytho
 The catalog never contains generic SQL, filesystem browsing, Python execution, shell execution,
 dynamic import, unrestricted HTTP, or web-search tools.
 
-The evaluation additions accept only safe relative request/bundle/output paths. They are not
+The evaluation and baseline additions accept only safe relative request/bundle/output paths. They are not
 generic rule engines or artifact-query tools and may consume only the closed evaluation contract,
-evidence produced by the two allowlisted historical-study tools, and researcher-authored session
-events.
+evidence produced by the allowlisted tools, and researcher-authored session events.
 
 ## Tool request contract
 
@@ -70,6 +74,26 @@ The outer request envelope is closed:
   "tool_name": "historical_study.run"
 }
 ```
+
+Baseline requests use the same envelope:
+
+```json
+{
+  "arguments": {
+    "database": "research.sqlite3",
+    "output": "funding-baseline",
+    "specification": "funding-baseline.json"
+  },
+  "schema_version": 1,
+  "tool_name": "research_baseline.generate"
+}
+```
+
+`lagged_funding_receiver` requires a database for both generation and verification. `flat_control`,
+`static_long`, and `static_short` require `database: null`; supplying a database is an invalid
+request rather than unused authority. Successful control attestations record
+`database_consulted: false`. Baseline verification accepts the closed bundle path and, for the
+funding policy only, the authoritative database path.
 
 Unknown fields are rejected at every parsed layer. Tool paths use forward-slash relative paths
 under the session's research root. Absolute paths, `..`, empty or ambiguous components, symbolic
@@ -92,6 +116,15 @@ head have both been atomically replaced on the normal return path, so a successf
 cannot race a cooperative source update. The implementation flushes file contents but does not
 claim power-loss durability for containing-directory metadata; a hard interruption is handled by
 the fail-closed recovery rules below.
+
+Funding-baseline tools use the same barrier for database hashing, normalized-row and ingestion-
+lineage resolution, deterministic bundle regeneration, and the final main-file hash check. Active
+SQLite journal/WAL sidecars are rejected. WAL journal mode is therefore unsupported even when it
+starts sidecar-free if acquiring the barrier materializes WAL/SHM files; use a checkpointed,
+sidecar-free rollback-journal snapshot. A historical study carrying baseline provenance performs
+that origin requery again and additionally requires exact canonical schedule bytes and all five
+immutable baseline artifact references and hashes. The registered verifier never treats bundled
+evidence as its own independent source authority.
 
 ## Structured result envelope
 
@@ -123,6 +156,11 @@ kernel, and serializer. The adapter does not implement financial formulas. Its p
 identity combines the existing analytical study identity with the selected candle, funding, and
 oracle-alignment hashes. Descriptive study/session metadata and operational source-lineage clocks
 do not change that economic identity.
+
+Successful baseline results separately expose internal bundle integrity, origin status, portable
+market-data identity, portable source-lineage identity, and operational database SHA-256. The
+portable attestation identity excludes the operational database-byte hash; it is not a signature
+or a substitute for immutable source archives.
 
 ## Session persistence
 
@@ -190,6 +228,14 @@ Mutable database references retain their observed hash. Later session verificati
 changed database as an artifact-integrity failure, while invocation may still resolve the current
 bytes and append a new attempt. Earlier evidence is not rewritten.
 
+Baseline generation resolves specification bytes and, when required, authoritative database bytes.
+Baseline verification additionally treats every byte of the supplied bundle as mutable source
+input. An unchanged successfully verified request therefore appends no event. A self-consistent
+bundle rewrite, a changed artifact, or changed database evidence changes the resolved-input
+identity and creates a new attempt; origin or integrity failure is then recorded rather than
+reusing a stale success. Generated bundle outputs and baseline inputs bound into a historical study
+remain immutable artifact references.
+
 The idempotent-retry observation (`idempotent_retry: true`, original attempt number, and zero
 appended events) is returned to the caller but is not persisted. Persisting it would make network
 retry frequency part of analytical history even though no new evidence was produced. Retrying a
@@ -227,6 +273,15 @@ metrics cross-identities, dependency graph, warning summary, and ending-position
 is corruption detection rather than authentication; a party trusted to replace every artifact can
 still forge a new unsigned bundle, so signed provenance is explicitly outside checkpoint 1.
 
+Baseline verification has two deliberately separate layers. Internal verification checks the
+closed five-file inventory, hashes, schemas, and deterministic regeneration from bundled evidence.
+Origin verification does not trust that evidence: it either reapplies the versioned control policy
+without a database or independently requeries funding and recorded ingestion lineage from the
+locked database snapshot. A malicious but internally self-consistent funding bundle can pass the
+first layer and must fail the second. Current source-lineage authority ends at normalized rows plus
+their ingestion-run descriptor; the schema does not yet bind each row to immutable raw-response
+bytes, and no cryptographic signer attests the database.
+
 Portable exports contain structured session evidence and relative hash references only. They do
 not copy SQLite databases, raw API archives, or generated bundle contents. Operational timestamps
 remain in local event records for audit purposes but are explicitly omitted from portable exports
@@ -241,9 +296,11 @@ therefore do not silently enter an earlier evaluation, while mutation of any per
 still fails closed.
 
 Evaluation citations bind to that prefix and identify exact session events, tool results, or
-allowlisted scalar fields in immutable historical-study JSON artifacts. The evaluation verifier
-re-resolves them against the session and the closed historical-study bundle; a saved evaluation is
-not treated as self-authenticating.
+allowlisted scalar fields in immutable historical-study or baseline JSON artifacts. Baseline JSON
+authority is limited to four explicit schemas and immutable artifacts already present in the frozen
+prefix; `report.md`, arbitrary JSON files, generic filesystem paths, and prose claims are not
+citation authority. The evaluation verifier re-resolves citations against the session and the
+closed source bundle; a saved evaluation is not treated as self-authenticating.
 
 The evaluation adapter requires its request to equal the exact session head H seen immediately
 before first invocation. The evaluator writes the separate four-file bundle while assessing only
@@ -292,6 +349,8 @@ conflicting output return `2`. A negative research decision is not a process fai
 ```text
 wpr research tools list
 wpr research tools describe historical_study.run
+wpr research tools describe research_baseline.generate
+wpr research tools describe research_baseline.verify
 
 wpr research session create --spec session.json --output work/session
 wpr research session invoke --session work/session --request request.json
@@ -323,6 +382,6 @@ equally strict artifact contracts and an explicitly versioned evaluation policy.
 calculate funding, transform data, run SQL, reconstruct P&L, invent provenance, or bypass a failed
 gate in model text.
 
-Deferred work includes an LLM-backed orchestrator, standalone funding/price tools, deterministic strategy benchmarks,
-scheduling, distributed workers, vector databases, new exchanges, authenticated trading, and
-portfolio accounting.
+Deferred work includes an LLM-backed orchestrator, standalone funding/price tools, multi-baseline
+comparison and ranking, parameter optimization, scheduling, distributed workers, vector databases,
+new exchanges, authenticated trading, and portfolio accounting.

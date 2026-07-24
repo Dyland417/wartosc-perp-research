@@ -587,6 +587,21 @@ def render_historical_study_markdown(result: HistoricalStudyResult) -> str:
             f"- Components: runner `{HISTORICAL_STUDY_RUNNER_VERSION}`, accounting "
             f"`{ACCOUNTING_ENGINE_VERSION}`, metrics schema "
             f"`{PERFORMANCE_METRICS_SCHEMA_VERSION}`",
+        ]
+    )
+    if study.baseline_schedule_provenance is not None:
+        provenance = study.baseline_schedule_provenance
+        lines.extend(
+            [
+                f"- Attested baseline bundle: `{provenance.baseline_bundle_identity_sha256}`",
+                f"- Exact baseline schedule: `{provenance.target_schedule_sha256}`",
+                f"- Baseline origin status: `{provenance.origin_status}` under "
+                f"`{provenance.attestation_policy_id}/"
+                f"{provenance.attestation_policy_version}`",
+            ]
+        )
+    lines.extend(
+        [
             "",
             "Strategy generation remains separate so this runner receives an explicit target "
             "schedule and stays a narrow, auditable deterministic research tool.",
@@ -686,6 +701,8 @@ def build_historical_study_artifacts(
         "ending_position_status": ("open" if result.metrics.ending_position.is_open else "flat"),
         "files": {name: {"sha256": digest} for name, digest in sorted(file_hashes.items())},
     }
+    if result.specification.baseline_schedule_provenance is not None:
+        manifest["baseline_schedule_provenance"] = study_document["baseline_schedule_provenance"]
     payloads["manifest.json"] = _json_bytes(manifest)
     return HistoricalStudyArtifactBundle(files=payloads, manifest=manifest)
 
@@ -770,8 +787,16 @@ def validate_historical_study_artifacts(bundle: HistoricalStudyArtifactBundle) -
         "schema_version",
         "warning_summary",
     }
+    if "baseline_schedule_provenance" in study_document:
+        expected_manifest_fields.add("baseline_schedule_provenance")
     if set(bundle.manifest) != expected_manifest_fields:
         raise HistoricalStudyOutputError("Manifest fields are invalid")
+    if bundle.manifest.get("baseline_schedule_provenance") != study_document.get(
+        "baseline_schedule_provenance"
+    ):
+        raise HistoricalStudyOutputError(
+            "Manifest baseline-schedule provenance does not match the study"
+        )
     if (
         bundle.manifest.get("schema_version") != HISTORICAL_STUDY_BUNDLE_SCHEMA_VERSION
         or bundle.manifest.get("bundle_type") != "deterministic_single_instrument_historical_study"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -38,11 +39,107 @@ from .metrics import (
 HISTORICAL_STUDY_SCHEMA_VERSION = 1
 HISTORICAL_STUDY_RUNNER_VERSION = "1.0.0"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"[A-Za-z]:[\\/]")
 
 
 class HistoricalStudySpecificationError(ValueError):
     """Raised when a portable historical-study specification is invalid."""
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineScheduleProvenance:
+    """Typed portable link from an attested baseline to the consumed schedule."""
+
+    attestation_policy_id: str
+    attestation_policy_version: str
+    origin_status: str
+    baseline_name: str
+    baseline_version: int
+    baseline_bundle_schema_version: int
+    baseline_bundle_identity_sha256: str
+    baseline_analytical_identity_sha256: str
+    baseline_specification_sha256: str
+    target_schedule_sha256: str
+    decision_evidence_sha256: str
+    baseline_report_sha256: str
+    baseline_manifest_sha256: str
+    portable_market_data_identity_sha256: str | None
+    source_lineage_identity_sha256: str | None
+    portable_attestation_identity_sha256: str
+    schema_version: int = 1
+    provenance_type: str = "attested_research_baseline"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or self.provenance_type != "attested_research_baseline":
+            raise HistoricalStudySpecificationError(
+                "Baseline schedule provenance schema or type is unsupported"
+            )
+        if (self.attestation_policy_id, self.attestation_policy_version) != (
+            "wartosc.research-baseline-origin",
+            "1.0.0",
+        ):
+            raise HistoricalStudySpecificationError(
+                "Baseline schedule provenance uses an unsupported attestation policy"
+            )
+        if self.baseline_name not in {
+            "flat_control",
+            "static_long",
+            "static_short",
+            "lagged_funding_receiver",
+        }:
+            raise HistoricalStudySpecificationError(
+                "Baseline schedule provenance names an unsupported baseline"
+            )
+        if (
+            isinstance(self.baseline_version, bool)
+            or self.baseline_version != 1
+            or isinstance(self.baseline_bundle_schema_version, bool)
+            or self.baseline_bundle_schema_version != 1
+        ):
+            raise HistoricalStudySpecificationError(
+                "Baseline schedule provenance supports only baseline and bundle version 1"
+            )
+        for field_name in (
+            "baseline_bundle_identity_sha256",
+            "baseline_analytical_identity_sha256",
+            "baseline_specification_sha256",
+            "target_schedule_sha256",
+            "decision_evidence_sha256",
+            "baseline_report_sha256",
+            "baseline_manifest_sha256",
+            "portable_attestation_identity_sha256",
+        ):
+            if _SHA256.fullmatch(getattr(self, field_name)) is None:
+                raise HistoricalStudySpecificationError(
+                    f"'{field_name}' must be a lowercase SHA-256 digest"
+                )
+        for field_name in (
+            "portable_market_data_identity_sha256",
+            "source_lineage_identity_sha256",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and _SHA256.fullmatch(value) is None:
+                raise HistoricalStudySpecificationError(
+                    f"'{field_name}' must be null or a lowercase SHA-256 digest"
+                )
+        if self.baseline_name == "lagged_funding_receiver":
+            if (
+                self.origin_status != "origin_attested"
+                or self.portable_market_data_identity_sha256 is None
+                or self.source_lineage_identity_sha256 is None
+            ):
+                raise HistoricalStudySpecificationError(
+                    "Funding baseline provenance requires origin-attested source identities"
+                )
+        elif (
+            self.origin_status != "policy_attested"
+            or self.portable_market_data_identity_sha256 is not None
+            or self.source_lineage_identity_sha256 is not None
+        ):
+            raise HistoricalStudySpecificationError(
+                "Control-baseline provenance must use policy authority without market data"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +151,7 @@ class HistoricalStudySpecification:
     metrics: PerformanceMetricSpecification
     metadata: Mapping[str, str]
     schema_version: int = HISTORICAL_STUDY_SCHEMA_VERSION
+    baseline_schedule_provenance: BaselineScheduleProvenance | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.schema_version, bool) or self.schema_version != 1:
@@ -70,6 +168,16 @@ class HistoricalStudySpecification:
             raise TypeError("'valuation_sampling' must be ValuationSamplingSpecification")
         if not isinstance(self.metrics, PerformanceMetricSpecification):
             raise TypeError("'performance_metrics' must be PerformanceMetricSpecification")
+        if self.baseline_schedule_provenance is not None:
+            if not isinstance(self.baseline_schedule_provenance, BaselineScheduleProvenance):
+                raise TypeError(
+                    "'baseline_schedule_provenance' must be BaselineScheduleProvenance or null"
+                )
+            schedule_hash = _canonical_sha256(position_schedule_to_dict(self.schedule))
+            if self.baseline_schedule_provenance.target_schedule_sha256 != schedule_hash:
+                raise HistoricalStudySpecificationError(
+                    "Baseline provenance target schedule hash does not match position_schedule"
+                )
         if self.sampling.start < self.schedule.study_start:
             raise HistoricalStudySpecificationError(
                 "Sampling start must not precede the position-schedule study start"
@@ -140,6 +248,73 @@ def _mapping(value: object, context: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
         raise TypeError(f"{context} must be a JSON object")
     return value
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        (
+            json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def baseline_schedule_provenance_to_dict(
+    provenance: BaselineScheduleProvenance,
+) -> dict[str, Any]:
+    return {
+        "schema_version": provenance.schema_version,
+        "provenance_type": provenance.provenance_type,
+        "attestation_policy_id": provenance.attestation_policy_id,
+        "attestation_policy_version": provenance.attestation_policy_version,
+        "origin_status": provenance.origin_status,
+        "baseline_name": provenance.baseline_name,
+        "baseline_version": provenance.baseline_version,
+        "baseline_bundle_schema_version": provenance.baseline_bundle_schema_version,
+        "baseline_bundle_identity_sha256": provenance.baseline_bundle_identity_sha256,
+        "baseline_analytical_identity_sha256": (provenance.baseline_analytical_identity_sha256),
+        "baseline_specification_sha256": provenance.baseline_specification_sha256,
+        "target_schedule_sha256": provenance.target_schedule_sha256,
+        "decision_evidence_sha256": provenance.decision_evidence_sha256,
+        "baseline_report_sha256": provenance.baseline_report_sha256,
+        "baseline_manifest_sha256": provenance.baseline_manifest_sha256,
+        "portable_market_data_identity_sha256": (provenance.portable_market_data_identity_sha256),
+        "source_lineage_identity_sha256": provenance.source_lineage_identity_sha256,
+        "portable_attestation_identity_sha256": (provenance.portable_attestation_identity_sha256),
+    }
+
+
+def baseline_schedule_provenance_from_dict(
+    data: Mapping[str, Any],
+) -> BaselineScheduleProvenance:
+    fields = {
+        "schema_version",
+        "provenance_type",
+        "attestation_policy_id",
+        "attestation_policy_version",
+        "origin_status",
+        "baseline_name",
+        "baseline_version",
+        "baseline_bundle_schema_version",
+        "baseline_bundle_identity_sha256",
+        "baseline_analytical_identity_sha256",
+        "baseline_specification_sha256",
+        "target_schedule_sha256",
+        "decision_evidence_sha256",
+        "baseline_report_sha256",
+        "baseline_manifest_sha256",
+        "portable_market_data_identity_sha256",
+        "source_lineage_identity_sha256",
+        "portable_attestation_identity_sha256",
+    }
+    _validate_keys(
+        data,
+        allowed=fields,
+        required=fields,
+        context="Baseline schedule provenance",
+    )
+    return BaselineScheduleProvenance(
+        **{field: data[field] for field in fields},
+    )
 
 
 def _decimal_string(value: object, field_name: str) -> Decimal:
@@ -281,12 +456,13 @@ def historical_study_specification_from_dict(
         "schema_version",
         "study_id",
         "position_schedule",
+        "baseline_schedule_provenance",
         "execution_assumptions",
         "valuation_sampling",
         "performance_metrics",
         "metadata",
     }
-    required = allowed - {"metadata"}
+    required = allowed - {"metadata", "baseline_schedule_provenance"}
     _validate_keys(data, allowed=allowed, required=required, context="Study specification")
     if isinstance(data["schema_version"], bool) or data["schema_version"] != 1:
         raise HistoricalStudySpecificationError("Study 'schema_version' must be 1")
@@ -308,6 +484,16 @@ def historical_study_specification_from_dict(
                 _mapping(data["performance_metrics"], "Performance metrics")
             ),
             metadata=_mapping(metadata, "Study metadata"),
+            baseline_schedule_provenance=(
+                None
+                if "baseline_schedule_provenance" not in data
+                else baseline_schedule_provenance_from_dict(
+                    _mapping(
+                        data["baseline_schedule_provenance"],
+                        "Baseline schedule provenance",
+                    )
+                )
+            ),
         )
     except (TypeError, ValueError) as exc:
         if isinstance(exc, HistoricalStudySpecificationError):
@@ -370,6 +556,10 @@ def historical_study_specification_to_dict(
     }
     if specification.metadata:
         payload["metadata"] = dict(sorted(specification.metadata.items()))
+    if specification.baseline_schedule_provenance is not None:
+        payload["baseline_schedule_provenance"] = baseline_schedule_provenance_to_dict(
+            specification.baseline_schedule_provenance
+        )
     return payload
 
 
@@ -381,6 +571,7 @@ def analytical_study_identity_document(
     payload = historical_study_specification_to_dict(specification)
     payload.pop("study_id")
     payload.pop("metadata", None)
+    payload.pop("baseline_schedule_provenance", None)
     schedule = dict(payload["position_schedule"])
     schedule.pop("schedule_id")
     schedule.pop("name")

@@ -19,6 +19,14 @@ from wartosc_perp_research.backtests import (
     HistoricalStudyOutputError,
     load_historical_study_bundle,
 )
+from wartosc_perp_research.research.baseline_attestation import (
+    baseline_bundle_identity_sha256,
+)
+from wartosc_perp_research.research.baselines import (
+    BaselineArtifactBundle,
+    BaselineOutputError,
+    load_baseline_bundle,
+)
 
 from .contracts import (
     ArtifactReference,
@@ -208,7 +216,7 @@ class _EvidenceState:
     resolved: dict[str, _ResolvedCitation]
     unresolved: dict[str, str]
     artifact_checks: dict[Path, str | None]
-    bundle_cache: dict[Path, HistoricalStudyArtifactBundle]
+    bundle_cache: dict[Path, HistoricalStudyArtifactBundle | BaselineArtifactBundle]
 
 
 def _is_link_or_reparse(path: Path) -> bool:
@@ -372,7 +380,7 @@ def _bundle_for_artifact(
     context: ToolExecutionContext,
     reference: ArtifactReference,
     locator: JsonArtifactLocator,
-) -> tuple[HistoricalStudyArtifactBundle, Path]:
+) -> tuple[HistoricalStudyArtifactBundle | BaselineArtifactBundle, Path]:
     try:
         artifact_path = context.resolve(locator.logical_path, "cited artifact", kind="file")
     except (SafeToolPathError, ToolContractError) as exc:
@@ -388,12 +396,22 @@ def _bundle_for_artifact(
     bundle_path = artifact_path.parent
     bundle = state.bundle_cache.get(bundle_path)
     if bundle is None:
-        try:
-            bundle = load_historical_study_bundle(bundle_path)
-        except HistoricalStudyOutputError as exc:
-            raise ResearchEvaluationIntegrityError(
-                "Cited historical-study bundle failed closed verification"
-            ) from exc
+        if locator.schema_id.startswith("historical_study."):
+            try:
+                bundle = load_historical_study_bundle(bundle_path)
+            except HistoricalStudyOutputError as exc:
+                raise ResearchEvaluationIntegrityError(
+                    "Cited historical-study bundle failed closed verification"
+                ) from exc
+        elif locator.schema_id.startswith("research_baseline."):
+            try:
+                bundle = load_baseline_bundle(bundle_path)
+            except BaselineOutputError as exc:
+                raise ResearchEvaluationIntegrityError(
+                    "Cited research-baseline bundle failed closed verification"
+                ) from exc
+        else:  # pragma: no cover - locator contract is a closed allowlist
+            raise ResearchEvaluationIntegrityError("Cited bundle schema is unsupported")
         state.bundle_cache[bundle_path] = bundle
         for name, item in bundle.files.items():
             state.artifact_checks[bundle_path / name] = hashlib.sha256(item).hexdigest()
@@ -403,6 +421,72 @@ def _bundle_for_artifact(
         )
     state.artifact_checks[artifact_path] = digest
     return bundle, artifact_path
+
+
+def _verify_baseline_result_bundle_inventory(
+    result: ToolResult,
+    bundle: BaselineArtifactBundle,
+    bundle_logical_path: str,
+) -> None:
+    if result.tool_name == "research_baseline.generate":
+        references = result.output_artifacts
+    elif result.tool_name == "research_baseline.verify":
+        references = tuple(
+            item for item in result.input_artifacts if item.role == "research_baseline_bundle_input"
+        )
+    else:
+        raise ResearchEvaluationIntegrityError(
+            "Research-baseline citations require a registered baseline tool result"
+        )
+    if len(references) != len(bundle.files):
+        raise ResearchEvaluationIntegrityError(
+            "Baseline tool result does not bind the exact closed bundle inventory"
+        )
+    parent_paths = {item.logical_path.rsplit("/", 1)[0] for item in references}
+    by_name = {item.logical_path.rsplit("/", 1)[-1]: item for item in references}
+    if (
+        parent_paths != {bundle_logical_path}
+        or set(by_name) != set(bundle.files)
+        or any(
+            item.mutable_source
+            or item.role
+            not in {"research_baseline_bundle_input", "research_baseline_bundle_output"}
+            for item in references
+        )
+    ):
+        raise ResearchEvaluationIntegrityError(
+            "Baseline tool result has noncanonical immutable artifact references"
+        )
+    for name, content in bundle.files.items():
+        if by_name[name].sha256 != hashlib.sha256(content).hexdigest():
+            raise ResearchEvaluationIntegrityError(
+                f"Baseline tool result artifact hash mismatch: {name}"
+            )
+    if result.status is ToolExecutionStatus.COMPLETE:
+        evidence = result.evidence
+        baseline = evidence.get("baseline")
+        internal = evidence.get("internal_integrity")
+        hashes = {
+            name: hashlib.sha256(content).hexdigest() for name, content in bundle.files.items()
+        }
+        if (
+            not isinstance(baseline, Mapping)
+            or not isinstance(internal, Mapping)
+            or internal.get("status") != "verified"
+            or baseline.get("bundle_identity_sha256") != baseline_bundle_identity_sha256(bundle)
+            or baseline.get("baseline_name") != bundle.manifest["baseline_name"]
+            or baseline.get("baseline_version") != bundle.manifest["baseline_version"]
+            or baseline.get("analytical_identity_sha256")
+            != bundle.manifest["analytical_identity_sha256"]
+            or baseline.get("specification_sha256") != hashes["baseline-spec.json"]
+            or baseline.get("target_schedule_sha256") != hashes["target-schedule.json"]
+            or baseline.get("decision_evidence_sha256") != hashes["decision-evidence.json"]
+            or baseline.get("report_sha256") != hashes["report.md"]
+            or baseline.get("manifest_sha256") != hashes["manifest.json"]
+        ):
+            raise ResearchEvaluationIntegrityError(
+                "Baseline tool result is inconsistent with its verified bundle"
+            )
 
 
 def _resolve_citation(
@@ -452,6 +536,14 @@ def _resolve_citation(
         raise KeyError("artifact_reference_ambiguous")
     reference = references[0]
     bundle, artifact_path = _bundle_for_artifact(state, context, reference, locator)
+    if citation.source_type is CitationSource.RESEARCH_BASELINE_JSON:
+        if not isinstance(bundle, BaselineArtifactBundle):
+            raise KeyError("citation_bundle_type_mismatch")
+        _verify_baseline_result_bundle_inventory(
+            result,
+            bundle,
+            reference.logical_path.rsplit("/", 1)[0],
+        )
     name = artifact_path.name
     if name not in bundle.files:
         raise KeyError("artifact_not_in_closed_bundle")
@@ -498,9 +590,11 @@ def _historical_bundle_for_result(
 ) -> tuple[HistoricalStudyArtifactBundle, Path] | None:
     if result.tool_name == "historical_study.run":
         references = result.output_artifacts
+        mutable_inputs = tuple(item for item in result.input_artifacts if item.mutable_source)
+        immutable_inputs = tuple(item for item in result.input_artifacts if not item.mutable_source)
         if (
-            len(result.input_artifacts) != 2
-            or any(not item.mutable_source for item in result.input_artifacts)
+            len(mutable_inputs) != 2
+            or len(immutable_inputs) not in {0, 5}
             or any(item.mutable_source for item in references)
         ):
             raise ResearchEvaluationIntegrityError(
@@ -630,6 +724,7 @@ def _bundle_identity(bundle: HistoricalStudyArtifactBundle) -> str:
 
 
 def _verify_result_against_bundle(
+    state: _EvidenceState,
     result: ToolResult,
     bundle: HistoricalStudyArtifactBundle,
 ) -> None:
@@ -643,6 +738,10 @@ def _verify_result_against_bundle(
         "market_data": bundle.manifest.get("market_data"),
         "warning_summary": bundle.manifest.get("warning_summary"),
     }
+    if "baseline_schedule_provenance" in bundle.manifest:
+        expected_evidence["baseline_schedule_provenance"] = bundle.manifest[
+            "baseline_schedule_provenance"
+        ]
     bundle_references = (
         result.output_artifacts
         if result.tool_name == "historical_study.run"
@@ -672,16 +771,93 @@ def _verify_result_against_bundle(
                 "Selected tool result has noncanonical historical-study artifact metadata"
             )
     if result.tool_name == "historical_study.run":
-        input_by_role = {item.role: item for item in result.input_artifacts}
+        mutable_by_role = {
+            item.role: item for item in result.input_artifacts if item.mutable_source
+        }
+        baseline_inputs = tuple(
+            item for item in result.input_artifacts if item.role == "research_baseline_bundle_input"
+        )
+        expected_baseline_count = 5 if "baseline_schedule_provenance" in bundle.manifest else 0
         if (
-            len(input_by_role) != 2
-            or set(input_by_role) != {"historical_study_database", "historical_study_specification"}
-            or input_by_role["historical_study_database"].media_type != "application/vnd.sqlite3"
-            or input_by_role["historical_study_specification"].media_type != "application/json"
+            len(mutable_by_role) != 2
+            or set(mutable_by_role)
+            != {"historical_study_database", "historical_study_specification"}
+            or len(baseline_inputs) != expected_baseline_count
+            or len(result.input_artifacts) != 2 + expected_baseline_count
+            or mutable_by_role["historical_study_database"].media_type != "application/vnd.sqlite3"
+            or mutable_by_role["historical_study_specification"].media_type != "application/json"
+            or any(
+                item.mutable_source or item.media_type not in {"application/json", "text/markdown"}
+                for item in baseline_inputs
+            )
         ):
             raise ResearchEvaluationIntegrityError(
                 "Selected run result has noncanonical source artifact metadata"
             )
+        if baseline_inputs:
+            parent_paths = {item.logical_path.rsplit("/", 1)[0] for item in baseline_inputs}
+            names = {item.logical_path.rsplit("/", 1)[-1] for item in baseline_inputs}
+            if len(parent_paths) != 1 or names != {
+                "baseline-spec.json",
+                "decision-evidence.json",
+                "manifest.json",
+                "report.md",
+                "target-schedule.json",
+            }:
+                raise ResearchEvaluationIntegrityError(
+                    "Selected study does not bind one exact closed baseline bundle"
+                )
+            context = ToolExecutionContext(
+                state.snapshot.path.parent, reserved_paths=(state.snapshot.path,)
+            )
+            baseline_paths: list[Path] = []
+            for reference in baseline_inputs:
+                try:
+                    path = context.resolve(
+                        reference.logical_path, "study baseline input", kind="file"
+                    )
+                except (SafeToolPathError, ToolContractError) as exc:
+                    raise ResearchEvaluationIntegrityError(
+                        "Selected study baseline input is missing or unsafe"
+                    ) from exc
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                if digest != reference.sha256:
+                    raise ResearchEvaluationIntegrityError(
+                        "Selected study baseline input hash changed"
+                    )
+                state.artifact_checks[path] = digest
+                baseline_paths.append(path)
+            try:
+                baseline_bundle = load_baseline_bundle(baseline_paths[0].parent)
+            except BaselineOutputError as exc:
+                raise ResearchEvaluationIntegrityError(
+                    "Selected study baseline bundle failed closed verification"
+                ) from exc
+            provenance = bundle.manifest["baseline_schedule_provenance"]
+            if (
+                not isinstance(provenance, Mapping)
+                or provenance.get("baseline_bundle_identity_sha256")
+                != baseline_bundle_identity_sha256(baseline_bundle)
+                or provenance.get("baseline_specification_sha256")
+                != hashlib.sha256(baseline_bundle.files["baseline-spec.json"]).hexdigest()
+                or provenance.get("target_schedule_sha256")
+                != hashlib.sha256(baseline_bundle.files["target-schedule.json"]).hexdigest()
+                or provenance.get("decision_evidence_sha256")
+                != hashlib.sha256(baseline_bundle.files["decision-evidence.json"]).hexdigest()
+                or provenance.get("baseline_report_sha256")
+                != hashlib.sha256(baseline_bundle.files["report.md"]).hexdigest()
+                or provenance.get("baseline_manifest_sha256")
+                != hashlib.sha256(baseline_bundle.files["manifest.json"]).hexdigest()
+                or baseline_bundle.files["target-schedule.json"]
+                != canonical_json_bytes(
+                    strict_json_object(bundle.files["study.json"], "Selected study")[
+                        "position_schedule"
+                    ]
+                )
+            ):
+                raise ResearchEvaluationIntegrityError(
+                    "Selected study baseline provenance or exact schedule is inconsistent"
+                )
     if (
         result.status is not _bundle_status(bundle)
         or result.portable_analytical_identity_sha256 != _bundle_identity(bundle)
@@ -963,7 +1139,7 @@ def _evaluate_request(
                 needs_data = True
             else:
                 target_bundle, target_bundle_path = resolved_bundle
-                _verify_result_against_bundle(target_result, target_bundle)
+                _verify_result_against_bundle(state, target_result, target_bundle)
             if target_bundle is not None and target_result.status is ToolExecutionStatus.INCOMPLETE:
                 finding = _new_finding(
                     policy,
@@ -1605,20 +1781,28 @@ def _assert_evidence_stable(
     session_path: Path,
     target: FrozenSessionPrefix,
     artifact_checks: Mapping[Path, str | None],
-    bundle_checks: Mapping[Path, HistoricalStudyArtifactBundle],
+    bundle_checks: Mapping[Path, HistoricalStudyArtifactBundle | BaselineArtifactBundle],
 ) -> None:
     _frozen_snapshot(session_path, target)
     for path, expected_bundle in sorted(bundle_checks.items(), key=lambda item: item[0].as_posix()):
         try:
             safe_path = _safe_directory(path, must_exist=True, context="cited study bundle")
-            current_bundle = load_historical_study_bundle(safe_path)
-        except (HistoricalStudyOutputError, ResearchEvaluationPathError) as exc:
+            current_bundle = (
+                load_baseline_bundle(safe_path)
+                if isinstance(expected_bundle, BaselineArtifactBundle)
+                else load_historical_study_bundle(safe_path)
+            )
+        except (
+            BaselineOutputError,
+            HistoricalStudyOutputError,
+            ResearchEvaluationPathError,
+        ) as exc:
             raise ResearchEvaluationIntegrityError(
-                "Cited historical-study bundle changed during deterministic evaluation"
+                "Cited closed bundle changed during deterministic evaluation"
             ) from exc
         if dict(current_bundle.files) != dict(expected_bundle.files):
             raise ResearchEvaluationIntegrityError(
-                "Cited historical-study bundle changed during deterministic evaluation"
+                "Cited closed bundle changed during deterministic evaluation"
             )
     for path, expected in sorted(artifact_checks.items(), key=lambda item: item[0].as_posix()):
         if expected is None:

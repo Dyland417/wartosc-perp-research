@@ -13,6 +13,8 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from wartosc_perp_research.backtests import (
     HistoricalStudyOutputError,
     HistoricalStudyOutputPathError,
@@ -21,8 +23,30 @@ from wartosc_perp_research.backtests import (
     historical_study_specification_from_dict,
     historical_study_specification_to_dict,
     load_historical_study_bundle,
+    position_schedule_to_dict,
     run_historical_study,
     write_historical_study_bundle,
+)
+from wartosc_perp_research.research.baseline_attestation import (
+    BaselineOriginAttestation,
+    BaselineOriginAttestationError,
+    attest_baseline_origin,
+    baseline_attestation_failure_evidence,
+)
+from wartosc_perp_research.research.baseline_repository import (
+    BaselineFundingSourceResolution,
+    resolve_baseline_funding_source,
+)
+from wartosc_perp_research.research.baselines import (
+    BaselineArtifactBundle,
+    BaselineNeedsDataError,
+    BaselineOutputError,
+    BaselineSpecification,
+    baseline_specification_from_dict,
+    baseline_specification_to_dict,
+    generate_baseline,
+    load_baseline_bundle,
+    write_baseline_bundle,
 )
 from wartosc_perp_research.storage import Database
 
@@ -36,12 +60,13 @@ from .contracts import (
     ToolResult,
     ToolWarning,
     UnsupportedToolError,
+    canonical_json_bytes,
     canonical_sha256,
     strict_json_object,
     validate_keys,
 )
 
-TOOL_CATALOG_VERSION = "1.1.0"
+TOOL_CATALOG_VERSION = "1.2.0"
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SECRET_PATH = re.compile(r"(?:gh[opsu]_|sk-|AKIA)", re.IGNORECASE)
 HISTORICAL_STUDY_LIMITATIONS = (
@@ -56,6 +81,14 @@ _EVALUATION_LIMITATIONS = (
     "establish profitability.",
     "Free-form natural-language claims are preserved but are not semantically proved.",
     "An evaluation decision does not authorize live trading or replace human research judgment.",
+)
+_BASELINE_LIMITATIONS = (
+    "A deterministic baseline is a comparator schedule, not evidence of profitability, "
+    "persistence, or executable trading.",
+    "Origin attestation proves bounded bundle integrity and source re-resolution; it does not "
+    "authenticate the database author or cryptographically sign exchange data.",
+    "Funding lineage is limited to the recorded normalized ingestion-run descriptor because "
+    "funding rows are not yet linked to immutable raw-response source-row hashes.",
 )
 ACCOUNTING_WARNING_CODES_BY_MESSAGE = MappingProxyType(
     {
@@ -111,6 +144,22 @@ class SafeToolPathError(ToolContractError):
 
 class ToolInputConflictError(RuntimeError):
     """Raised when a mutable input cannot be held stable for deterministic execution."""
+
+
+class BaselineDatabasePolicyError(ToolContractError):
+    """Raised before execution when a baseline request violates database authority policy."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+class BaselineSourceUnavailableError(RuntimeError):
+    """Raised when authoritative baseline evidence cannot be queried safely."""
+
+    def __init__(self, database_sha256: str | None, message: str) -> None:
+        super().__init__(message)
+        self.database_sha256 = database_sha256
 
 
 class _SQLiteReadBarrier:
@@ -416,6 +465,34 @@ class ResearchToolDispatcher:
                 "unsafe_tool_path",
                 _portable_message(str(exc), context),
             )
+        except BaselineDatabasePolicyError as exc:
+            return _unprepared_failure(
+                request,
+                FailureCategory.INVALID_REQUEST,
+                "invalid_tool_request",
+                _portable_message(str(exc), context),
+                limitations=_BASELINE_LIMITATIONS,
+                evidence=baseline_attestation_failure_evidence(
+                    internal_integrity_status="not_evaluated",
+                    origin_status="not_evaluated",
+                    failure_reason=exc.reason_code,
+                    operational_database_sha256=None,
+                ),
+            )
+        except BaselineSourceUnavailableError as exc:
+            return _unprepared_failure(
+                request,
+                FailureCategory.UNAVAILABLE_OR_INCOMPLETE_DATA,
+                "baseline_source_needs_data",
+                _portable_message(str(exc), context),
+                limitations=_BASELINE_LIMITATIONS,
+                evidence=baseline_attestation_failure_evidence(
+                    internal_integrity_status="not_evaluated",
+                    origin_status="needs_data",
+                    failure_reason="source_database_unavailable",
+                    operational_database_sha256=exc.database_sha256,
+                ),
+            )
         except ToolContractError as exc:
             return _unprepared_failure(
                 request,
@@ -457,9 +534,27 @@ def _validate_path_arguments(
 
 
 def _validate_run(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
-    return _validate_path_arguments(
-        arguments, {"database", "specification", "output"}, "Historical-study run arguments"
+    validate_keys(
+        arguments,
+        allowed={"database", "specification", "output", "baseline_bundle"},
+        required={"database", "specification", "output"},
+        context="Historical-study run arguments",
     )
+    normalized = dict(
+        _validate_path_arguments(
+            {key: arguments[key] for key in ("database", "specification", "output")},
+            {"database", "specification", "output"},
+            "Historical-study run arguments",
+        )
+    )
+    baseline_bundle = arguments.get("baseline_bundle")
+    if baseline_bundle is not None:
+        normalized["baseline_bundle"] = _validate_path_arguments(
+            {"baseline_bundle": baseline_bundle},
+            {"baseline_bundle"},
+            "Historical-study run baseline arguments",
+        )["baseline_bundle"]
+    return MappingProxyType(normalized)
 
 
 def _validate_verify(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -477,6 +572,47 @@ def _validate_evaluate(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
 def _validate_evaluation_verify(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
     return _validate_path_arguments(
         arguments, {"bundle"}, "Research-evaluation verification arguments"
+    )
+
+
+def _validate_nullable_database_path(
+    arguments: Mapping[str, Any],
+    *,
+    path_fields: set[str],
+    context: str,
+) -> Mapping[str, Any]:
+    fields = path_fields | {"database"}
+    validate_keys(arguments, allowed=fields, required=fields, context=context)
+    normalized = dict(
+        _validate_path_arguments(
+            {field: arguments[field] for field in path_fields},
+            path_fields,
+            context,
+        )
+    )
+    database = arguments["database"]
+    if database is None:
+        normalized["database"] = None
+    else:
+        normalized["database"] = _validate_path_arguments(
+            {"database": database}, {"database"}, context
+        )["database"]
+    return MappingProxyType(normalized)
+
+
+def _validate_baseline_generate(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _validate_nullable_database_path(
+        arguments,
+        path_fields={"specification", "output"},
+        context="Research-baseline generation arguments",
+    )
+
+
+def _validate_baseline_verify(arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _validate_nullable_database_path(
+        arguments,
+        path_fields={"bundle"},
+        context="Research-baseline verification arguments",
     )
 
 
@@ -531,6 +667,290 @@ def _request_identity(request: ToolRequest, arguments: Mapping[str, Any]) -> str
     )
 
 
+def _assert_paths_do_not_overlap(output: Path, *inputs: Path) -> None:
+    if any(
+        output == source or output in source.parents or source in output.parents
+        for source in inputs
+    ):
+        raise SafeToolPathError("Tool output must not overlap any input path")
+
+
+def _baseline_bundle_snapshot(
+    bundle_path: Path,
+    context: ToolExecutionContext,
+    *,
+    role: str,
+    mutable_source: bool = False,
+) -> tuple[list[dict[str, Any]], tuple[ArtifactReference, ...]]:
+    entries: list[dict[str, Any]] = []
+    references: list[ArtifactReference] = []
+    for child in sorted(bundle_path.iterdir(), key=lambda item: item.name):
+        if child.is_file() and not _is_link_or_reparse(child):
+            reference = _reference(
+                child,
+                context,
+                role,
+                mutable_source=mutable_source,
+            )
+            references.append(reference)
+            entries.append({"logical_path": reference.logical_path, "sha256": reference.sha256})
+        else:
+            entries.append({"invalid_entry": context.logical_path(child)})
+    return entries, tuple(references)
+
+
+def _resolve_baseline_source(
+    database_path: Path,
+    specification: BaselineSpecification,
+) -> tuple[
+    _SQLiteReadBarrier,
+    str,
+    BaselineFundingSourceResolution,
+]:
+    barrier = _SQLiteReadBarrier(database_path)
+    barrier.__enter__()
+    database_sha256: str | None = None
+    try:
+        database_sha256 = _sha256_file(database_path)
+        database = Database(f"sqlite+pysqlite:///{database_path.as_posix()}")
+        try:
+            resolution = resolve_baseline_funding_source(
+                database,
+                exchange=specification.exchange,
+                instrument=specification.instrument,
+                start=specification.study_start,
+                end=specification.study_end,
+            )
+        finally:
+            database.dispose()
+        barrier.assert_held()
+        if _sha256_file(database_path) != database_sha256:
+            raise ToolInputConflictError(
+                "Research database changed while baseline source evidence was resolved"
+            )
+        return barrier, database_sha256, resolution
+    except (SQLAlchemyError, ArithmeticError, TypeError, ValueError) as exc:
+        barrier.close()
+        raise BaselineSourceUnavailableError(
+            database_sha256,
+            "Research database could not provide authoritative baseline evidence",
+        ) from exc
+    except Exception:
+        barrier.close()
+        raise
+
+
+def _baseline_source_identity_document(
+    source: BaselineFundingSourceResolution | None,
+    database_sha256: str | None,
+) -> dict[str, Any]:
+    return {
+        "operational_database_sha256": database_sha256,
+        "portable_market_data_identity_sha256": (
+            None if source is None else source.portable_market_data_identity_sha256
+        ),
+        "source_lineage_identity_sha256": (
+            None if source is None else source.source_lineage_identity_sha256
+        ),
+        "source_lineage_status": (
+            "not_applicable" if source is None else source.source_lineage_status
+        ),
+        "source_resolution_status": (
+            "not_applicable" if source is None else source.resolution_status
+        ),
+        "source_resolution_failure": (None if source is None else source.failure_reason),
+    }
+
+
+def _resolve_baseline_generate(
+    request: ToolRequest,
+    arguments: Mapping[str, Any],
+    context: ToolExecutionContext,
+) -> PreparedToolRequest:
+    specification_path = context.resolve(arguments["specification"], "specification", kind="file")
+    output_path = context.resolve(arguments["output"], "output", kind="output")
+    _assert_paths_do_not_overlap(output_path, specification_path)
+    specification_bytes = specification_path.read_bytes()
+    specification_document = strict_json_object(
+        specification_bytes, "Research-baseline specification"
+    )
+    try:
+        specification = baseline_specification_from_dict(specification_document)
+    except (TypeError, ValueError) as exc:
+        raise ToolContractError(str(exc)) from exc
+
+    database_argument = arguments["database"]
+    requires_database = specification.baseline_name == "lagged_funding_receiver"
+    if requires_database and database_argument is None:
+        raise BaselineDatabasePolicyError(
+            "source_snapshot_unavailable",
+            "'database' is required for the lagged_funding_receiver baseline",
+        )
+    if not requires_database and database_argument is not None:
+        raise BaselineDatabasePolicyError(
+            "inappropriate_database_use",
+            "'database' is forbidden for flat and static baselines",
+        )
+
+    barrier: _SQLiteReadBarrier | None = None
+    database_path: Path | None = None
+    database_sha256: str | None = None
+    source: BaselineFundingSourceResolution | None = None
+    input_artifacts: list[ArtifactReference] = [
+        _reference(
+            specification_path,
+            context,
+            "research_baseline_specification",
+            mutable_source=True,
+            expected_sha256=hashlib.sha256(specification_bytes).hexdigest(),
+        )
+    ]
+    try:
+        if requires_database:
+            database_path = context.resolve(database_argument, "database", kind="file")
+            _assert_paths_do_not_overlap(output_path, database_path)
+            barrier, database_sha256, source = _resolve_baseline_source(
+                database_path, specification
+            )
+            input_artifacts.insert(
+                0,
+                ArtifactReference(
+                    logical_path=context.logical_path(database_path),
+                    sha256=database_sha256,
+                    role="research_baseline_database",
+                    media_type=_media_type(database_path),
+                    mutable_source=True,
+                ),
+            )
+        resolved_document = {
+            "normalized_specification": baseline_specification_to_dict(specification),
+            "source": _baseline_source_identity_document(source, database_sha256),
+            "tool_name": request.tool_name,
+            "tool_schema_version": request.schema_version,
+        }
+        return PreparedToolRequest(
+            request=request,
+            normalized_arguments=arguments,
+            request_identity_sha256=_request_identity(request, arguments),
+            resolved_input_identity_sha256=canonical_sha256(resolved_document),
+            input_artifacts=tuple(input_artifacts),
+            runtime=MappingProxyType(
+                {
+                    "database_path": database_path,
+                    "database_read_barrier": barrier,
+                    "database_sha256": database_sha256,
+                    "output_path": output_path,
+                    "source_resolution": source,
+                    "specification": specification,
+                    "specification_path": specification_path,
+                    "specification_sha256": hashlib.sha256(specification_bytes).hexdigest(),
+                }
+            ),
+        )
+    except Exception:
+        if barrier is not None:
+            barrier.close()
+        raise
+
+
+def _resolve_baseline_verify(
+    request: ToolRequest,
+    arguments: Mapping[str, Any],
+    context: ToolExecutionContext,
+) -> PreparedToolRequest:
+    bundle_path = context.resolve(arguments["bundle"], "bundle", kind="directory")
+    entries, references = _baseline_bundle_snapshot(
+        bundle_path,
+        context,
+        role="research_baseline_bundle_input",
+        mutable_source=True,
+    )
+    database_argument = arguments["database"]
+    database_path: Path | None = None
+
+    bundle_error: str | None = None
+    bundle: BaselineArtifactBundle | None = None
+    specification: BaselineSpecification | None = None
+    try:
+        bundle = load_baseline_bundle(bundle_path)
+        specification = baseline_specification_from_dict(
+            strict_json_object(
+                bundle.files["baseline-spec.json"], "Research-baseline specification"
+            )
+        )
+    except (BaselineOutputError, ToolContractError, TypeError, ValueError) as exc:
+        bundle_error = str(exc)
+
+    barrier: _SQLiteReadBarrier | None = None
+    database_sha256: str | None = None
+    source: BaselineFundingSourceResolution | None = None
+    try:
+        if specification is not None:
+            requires_database = specification.baseline_name == "lagged_funding_receiver"
+            if requires_database and database_argument is None:
+                raise BaselineDatabasePolicyError(
+                    "source_snapshot_unavailable",
+                    "'database' is required to verify lagged_funding_receiver origin",
+                )
+            if not requires_database and database_argument is not None:
+                raise BaselineDatabasePolicyError(
+                    "inappropriate_database_use",
+                    "'database' is forbidden for flat and static baselines",
+                )
+            if requires_database:
+                database_path = context.resolve(database_argument, "database", kind="file")
+                if (
+                    database_path == bundle_path
+                    or database_path in bundle_path.parents
+                    or bundle_path in database_path.parents
+                ):
+                    raise SafeToolPathError(
+                        "Baseline bundle must not overlap the research database"
+                    )
+                barrier, database_sha256, source = _resolve_baseline_source(
+                    database_path, specification
+                )
+                references = (
+                    ArtifactReference(
+                        logical_path=context.logical_path(database_path),
+                        sha256=database_sha256,
+                        role="research_baseline_database",
+                        media_type=_media_type(database_path),
+                        mutable_source=True,
+                    ),
+                    *references,
+                )
+        resolved_document = {
+            "bundle_entries": entries,
+            "bundle_parse_error": bundle_error,
+            "source": _baseline_source_identity_document(source, database_sha256),
+            "tool_name": request.tool_name,
+            "tool_schema_version": request.schema_version,
+        }
+        return PreparedToolRequest(
+            request=request,
+            normalized_arguments=arguments,
+            request_identity_sha256=_request_identity(request, arguments),
+            resolved_input_identity_sha256=canonical_sha256(resolved_document),
+            input_artifacts=tuple(references),
+            runtime=MappingProxyType(
+                {
+                    "bundle_entries": tuple(entries),
+                    "bundle_error": bundle_error,
+                    "bundle_path": bundle_path,
+                    "database_path": database_path,
+                    "database_read_barrier": barrier,
+                    "database_sha256": database_sha256,
+                    "source_resolution": source,
+                }
+            ),
+        )
+    except Exception:
+        if barrier is not None:
+            barrier.close()
+        raise
+
+
 def _resolve_run(
     request: ToolRequest,
     arguments: Mapping[str, Any],
@@ -539,17 +959,103 @@ def _resolve_run(
     database_path = context.resolve(arguments["database"], "database", kind="file")
     specification_path = context.resolve(arguments["specification"], "specification", kind="file")
     output_path = context.resolve(arguments["output"], "output", kind="output")
+    _assert_paths_do_not_overlap(output_path, database_path, specification_path)
+    specification_bytes = specification_path.read_bytes()
     specification_document = strict_json_object(
-        specification_path.read_bytes(), "Historical-study specification"
+        specification_bytes, "Historical-study specification"
     )
     try:
         specification = historical_study_specification_from_dict(specification_document)
     except (TypeError, ValueError) as exc:
         raise ToolContractError(str(exc)) from exc
+    provenance = specification.baseline_schedule_provenance
+    baseline_argument = arguments.get("baseline_bundle")
+    if provenance is None and baseline_argument is not None:
+        raise ToolContractError(
+            "'baseline_bundle' requires typed baseline_schedule_provenance in the study"
+        )
+    if provenance is not None and baseline_argument is None:
+        raise ToolContractError(
+            "'baseline_bundle' is required by typed baseline_schedule_provenance"
+        )
+    baseline_path: Path | None = None
+    baseline_bundle: BaselineArtifactBundle | None = None
+    baseline_entries: list[dict[str, Any]] = []
+    baseline_references: tuple[ArtifactReference, ...] = ()
+    if baseline_argument is not None:
+        baseline_path = context.resolve(baseline_argument, "baseline_bundle", kind="directory")
+        _assert_paths_do_not_overlap(output_path, baseline_path)
+        baseline_entries, baseline_references = _baseline_bundle_snapshot(
+            baseline_path,
+            context,
+            role="research_baseline_bundle_input",
+        )
+        try:
+            baseline_bundle = load_baseline_bundle(baseline_path)
+        except BaselineOutputError as exc:
+            raise ToolContractError(
+                f"Baseline provenance bundle failed closed validation: {exc}"
+            ) from exc
+
     barrier = _SQLiteReadBarrier(database_path)
     barrier.__enter__()
     try:
         database_sha256 = _sha256_file(database_path)
+        baseline_attestation: BaselineOriginAttestation | None = None
+        if baseline_bundle is not None:
+            baseline_specification = baseline_specification_from_dict(
+                strict_json_object(
+                    baseline_bundle.files["baseline-spec.json"],
+                    "Research-baseline specification",
+                )
+            )
+            baseline_source = None
+            if baseline_specification.baseline_name == "lagged_funding_receiver":
+                database = Database(f"sqlite+pysqlite:///{database_path.as_posix()}")
+                try:
+                    baseline_source = resolve_baseline_funding_source(
+                        database,
+                        exchange=baseline_specification.exchange,
+                        instrument=baseline_specification.instrument,
+                        start=baseline_specification.study_start,
+                        end=baseline_specification.study_end,
+                    )
+                finally:
+                    database.dispose()
+            barrier.assert_held()
+            if _sha256_file(database_path) != database_sha256:
+                raise ToolInputConflictError(
+                    "Research database changed while study baseline provenance was resolved"
+                )
+            try:
+                baseline_attestation = attest_baseline_origin(
+                    baseline_bundle,
+                    source=baseline_source,
+                    operational_database_sha256=(
+                        database_sha256
+                        if baseline_specification.baseline_name == "lagged_funding_receiver"
+                        else None
+                    ),
+                )
+            except BaselineOriginAttestationError as exc:
+                raise ToolContractError(
+                    f"Baseline source-origin attestation failed ({exc.reason_code}): {exc}"
+                ) from exc
+            if baseline_bundle.files["target-schedule.json"] != canonical_json_bytes(
+                position_schedule_to_dict(specification.schedule)
+            ):
+                raise ToolContractError(
+                    "Historical-study position schedule is not the exact baseline schedule"
+                )
+            if dict(baseline_attestation.study_schedule_provenance()) != (
+                historical_study_specification_to_dict(specification).get(
+                    "baseline_schedule_provenance"
+                )
+            ):
+                raise ToolContractError(
+                    "Historical-study baseline provenance does not match the attested bundle"
+                )
+
         input_artifacts = (
             ArtifactReference(
                 logical_path=context.logical_path(database_path),
@@ -563,9 +1069,15 @@ def _resolve_run(
                 context,
                 "historical_study_specification",
                 mutable_source=True,
+                expected_sha256=hashlib.sha256(specification_bytes).hexdigest(),
             ),
+            *baseline_references,
         )
         resolved_document = {
+            "baseline_bundle_entries": baseline_entries,
+            "baseline_origin_attestation": (
+                None if baseline_attestation is None else baseline_attestation.to_dict()
+            ),
             "database_sha256": database_sha256,
             "normalized_specification": historical_study_specification_to_dict(specification),
             "tool_name": request.tool_name,
@@ -582,8 +1094,13 @@ def _resolve_run(
                     "database_path": database_path,
                     "database_read_barrier": barrier,
                     "database_sha256": database_sha256,
+                    "baseline_origin_attestation": baseline_attestation,
+                    "baseline_bundle_path": baseline_path,
+                    "baseline_bundle_entries": tuple(baseline_entries),
                     "output_path": output_path,
                     "specification": specification,
+                    "specification_path": specification_path,
+                    "specification_sha256": hashlib.sha256(specification_bytes).hexdigest(),
                 }
             ),
         )
@@ -727,6 +1244,304 @@ def _resolve_evaluation_verify(
     )
 
 
+def _baseline_success_evidence(
+    attestation: BaselineOriginAttestation,
+) -> dict[str, Any]:
+    value = attestation.to_dict()
+    value["study_schedule_provenance"] = dict(attestation.study_schedule_provenance())
+    return value
+
+
+def _baseline_success_result(
+    prepared: PreparedToolRequest,
+    attestation: BaselineOriginAttestation,
+    *,
+    output_artifacts: tuple[ArtifactReference, ...] = (),
+) -> ToolResult:
+    return ToolResult(
+        tool_name=prepared.request.tool_name,
+        tool_schema_version=prepared.request.schema_version,
+        status=ToolExecutionStatus.COMPLETE,
+        request_identity_sha256=prepared.request_identity_sha256,
+        resolved_input_identity_sha256=prepared.resolved_input_identity_sha256,
+        portable_analytical_identity_sha256=(attestation.portable_attestation_identity_sha256),
+        input_artifacts=prepared.input_artifacts,
+        output_artifacts=output_artifacts,
+        warnings=(),
+        limitations=_BASELINE_LIMITATIONS,
+        errors=(),
+        evidence=_baseline_success_evidence(attestation),
+    )
+
+
+def _baseline_failure_result(
+    prepared: PreparedToolRequest,
+    *,
+    category: FailureCategory,
+    code: str,
+    message: str,
+    internal_integrity_status: str,
+    origin_status: str,
+    failure_reason: str,
+    context: ToolExecutionContext,
+) -> ToolResult:
+    return ToolResult(
+        tool_name=prepared.request.tool_name,
+        tool_schema_version=prepared.request.schema_version,
+        status=ToolExecutionStatus.FAILED,
+        request_identity_sha256=prepared.request_identity_sha256,
+        resolved_input_identity_sha256=prepared.resolved_input_identity_sha256,
+        portable_analytical_identity_sha256=None,
+        input_artifacts=prepared.input_artifacts,
+        output_artifacts=(),
+        warnings=(),
+        limitations=_BASELINE_LIMITATIONS,
+        errors=(
+            ToolError(
+                category=category,
+                code=code,
+                message=_portable_message(message, context),
+            ),
+        ),
+        evidence=baseline_attestation_failure_evidence(
+            internal_integrity_status=internal_integrity_status,
+            origin_status=origin_status,
+            failure_reason=failure_reason,
+            operational_database_sha256=prepared.runtime.get("database_sha256"),
+        ),
+    )
+
+
+def _assert_baseline_source_stable(prepared: PreparedToolRequest) -> None:
+    specification_path = prepared.runtime.get("specification_path")
+    if (
+        isinstance(specification_path, Path)
+        and _sha256_file(specification_path) != (prepared.runtime["specification_sha256"])
+    ):
+        raise ToolInputConflictError(
+            "Research-baseline specification changed after input resolution"
+        )
+    barrier = prepared.runtime.get("database_read_barrier")
+    database_path = prepared.runtime.get("database_path")
+    database_sha256 = prepared.runtime.get("database_sha256")
+    if isinstance(barrier, _SQLiteReadBarrier):
+        barrier.assert_held()
+        if not isinstance(database_path, Path) or _sha256_file(database_path) != database_sha256:
+            raise ToolInputConflictError(
+                "Research database changed after baseline source resolution"
+            )
+
+
+def _baseline_output_references(
+    bundle: BaselineArtifactBundle,
+    bundle_path: Path,
+    context: ToolExecutionContext,
+) -> tuple[ArtifactReference, ...]:
+    if {item.name for item in bundle_path.iterdir()} != set(bundle.files):
+        raise ToolInputConflictError("Baseline output inventory changed before artifact binding")
+    references: list[ArtifactReference] = []
+    for name, content in sorted(bundle.files.items()):
+        expected = hashlib.sha256(content).hexdigest()
+        reference = _reference(
+            bundle_path / name,
+            context,
+            "research_baseline_bundle_output",
+            expected_sha256=expected,
+        )
+        if (bundle_path / name).read_bytes() != content:
+            raise ToolInputConflictError("Baseline output changed during artifact binding")
+        references.append(reference)
+    return tuple(references)
+
+
+def _assert_baseline_verify_input_stable(
+    prepared: PreparedToolRequest,
+    context: ToolExecutionContext,
+) -> None:
+    entries, references = _baseline_bundle_snapshot(
+        prepared.runtime["bundle_path"],
+        context,
+        role="research_baseline_bundle_input",
+        mutable_source=True,
+    )
+    if entries != list(prepared.runtime["bundle_entries"]):
+        raise ToolInputConflictError("Baseline bundle changed after input resolution")
+    expected = [
+        item.to_dict()
+        for item in prepared.input_artifacts
+        if item.role == "research_baseline_bundle_input"
+    ]
+    if [item.to_dict() for item in references] != expected:
+        raise ToolInputConflictError("Baseline bundle identity changed after input resolution")
+    _assert_baseline_source_stable(prepared)
+
+
+def _execute_baseline_generate(
+    prepared: PreparedToolRequest,
+    context: ToolExecutionContext,
+) -> ToolResult:
+    try:
+        _assert_baseline_source_stable(prepared)
+        source = prepared.runtime["source_resolution"]
+        if source is not None and source.resolution_status != "resolved":
+            raise BaselineNeedsDataError(
+                source.failure_reason or "Authoritative baseline source lineage is unsupported"
+            )
+        result = generate_baseline(
+            prepared.runtime["specification"],
+            () if source is None else source.evidence,
+        )
+        paths = write_baseline_bundle(result, prepared.runtime["output_path"])
+        bundle_path = paths.manifest_json.parent
+        bundle = load_baseline_bundle(bundle_path)
+        _assert_baseline_source_stable(prepared)
+        attestation = attest_baseline_origin(
+            bundle,
+            source=source,
+            operational_database_sha256=prepared.runtime["database_sha256"],
+        )
+        return _baseline_success_result(
+            prepared,
+            attestation,
+            output_artifacts=_baseline_output_references(bundle, bundle_path, context),
+        )
+    except BaselineNeedsDataError as exc:
+        return _baseline_failure_result(
+            prepared,
+            category=FailureCategory.UNAVAILABLE_OR_INCOMPLETE_DATA,
+            code="baseline_source_needs_data",
+            message=str(exc),
+            internal_integrity_status="not_evaluated",
+            origin_status="needs_data",
+            failure_reason="authoritative_evidence_unavailable",
+            context=context,
+        )
+    except BaselineOriginAttestationError as exc:
+        return _baseline_failure_result(
+            prepared,
+            category=FailureCategory.ARTIFACT_INTEGRITY_FAILURE,
+            code="baseline_origin_unverifiable",
+            message=str(exc),
+            internal_integrity_status="verified",
+            origin_status="origin_unverifiable",
+            failure_reason=exc.reason_code,
+            context=context,
+        )
+    except BaselineOutputError as exc:
+        return _baseline_failure_result(
+            prepared,
+            category=FailureCategory.UNSAFE_PATH_OR_OUTPUT_CONFLICT,
+            code="baseline_output_conflict",
+            message=str(exc),
+            internal_integrity_status="not_evaluated",
+            origin_status="not_evaluated",
+            failure_reason="output_conflict",
+            context=context,
+        )
+
+
+def _execute_baseline_verify(
+    prepared: PreparedToolRequest,
+    context: ToolExecutionContext,
+) -> ToolResult:
+    if prepared.runtime["bundle_error"] is not None:
+        return _baseline_failure_result(
+            prepared,
+            category=FailureCategory.ARTIFACT_INTEGRITY_FAILURE,
+            code="baseline_bundle_integrity",
+            message=prepared.runtime["bundle_error"],
+            internal_integrity_status="failed",
+            origin_status="not_evaluated",
+            failure_reason="internal_bundle_integrity_failure",
+            context=context,
+        )
+    try:
+        _assert_baseline_verify_input_stable(prepared, context)
+        bundle = load_baseline_bundle(prepared.runtime["bundle_path"])
+        attestation = attest_baseline_origin(
+            bundle,
+            source=prepared.runtime["source_resolution"],
+            operational_database_sha256=prepared.runtime["database_sha256"],
+        )
+        _assert_baseline_verify_input_stable(prepared, context)
+        return _baseline_success_result(prepared, attestation)
+    except BaselineOriginAttestationError as exc:
+        return _baseline_failure_result(
+            prepared,
+            category=FailureCategory.ARTIFACT_INTEGRITY_FAILURE,
+            code="baseline_origin_unverifiable",
+            message=str(exc),
+            internal_integrity_status="verified",
+            origin_status="origin_unverifiable",
+            failure_reason=exc.reason_code,
+            context=context,
+        )
+    except BaselineOutputError as exc:
+        return _baseline_failure_result(
+            prepared,
+            category=FailureCategory.ARTIFACT_INTEGRITY_FAILURE,
+            code="baseline_bundle_integrity",
+            message=str(exc),
+            internal_integrity_status="failed",
+            origin_status="not_evaluated",
+            failure_reason="internal_bundle_integrity_failure",
+            context=context,
+        )
+
+
+def _cached_baseline_generation_is_current(
+    prepared: PreparedToolRequest,
+    result: ToolResult,
+    context: ToolExecutionContext,
+) -> bool:
+    _assert_baseline_source_stable(prepared)
+    if result.status is ToolExecutionStatus.FAILED:
+        return all(
+            item.category
+            not in {
+                FailureCategory.INTERNAL_OPERATIONAL_FAILURE,
+                FailureCategory.UNSAFE_PATH_OR_OUTPUT_CONFLICT,
+            }
+            for item in result.errors
+        )
+    bundle = load_baseline_bundle(prepared.runtime["output_path"])
+    attestation = attest_baseline_origin(
+        bundle,
+        source=prepared.runtime["source_resolution"],
+        operational_database_sha256=prepared.runtime["database_sha256"],
+    )
+    expected = _baseline_success_result(
+        prepared,
+        attestation,
+        output_artifacts=_baseline_output_references(
+            bundle, prepared.runtime["output_path"], context
+        ),
+    )
+    _assert_baseline_source_stable(prepared)
+    return result == expected
+
+
+def _cached_baseline_verification_is_current(
+    prepared: PreparedToolRequest,
+    result: ToolResult,
+    context: ToolExecutionContext,
+) -> bool:
+    _assert_baseline_verify_input_stable(prepared, context)
+    if result.status is ToolExecutionStatus.FAILED:
+        return all(
+            item.category is not FailureCategory.INTERNAL_OPERATIONAL_FAILURE
+            for item in result.errors
+        )
+    bundle = load_baseline_bundle(prepared.runtime["bundle_path"])
+    attestation = attest_baseline_origin(
+        bundle,
+        source=prepared.runtime["source_resolution"],
+        operational_database_sha256=prepared.runtime["database_sha256"],
+    )
+    _assert_baseline_verify_input_stable(prepared, context)
+    return result == _baseline_success_result(prepared, attestation)
+
+
 def _bundle_identity(manifest: Mapping[str, Any]) -> str:
     identity = manifest.get("identity", {})
     market_data = manifest.get("market_data", {})
@@ -797,7 +1612,7 @@ def _bundle_status(manifest: Mapping[str, Any]) -> ToolExecutionStatus:
 
 
 def _bundle_evidence(manifest: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    evidence = {
         "bundle_type": manifest.get("bundle_type"),
         "components": manifest.get("components"),
         "ending_position_status": manifest.get("ending_position_status"),
@@ -805,12 +1620,50 @@ def _bundle_evidence(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "market_data": manifest.get("market_data"),
         "warning_summary": manifest.get("warning_summary"),
     }
+    if "baseline_schedule_provenance" in manifest:
+        evidence["baseline_schedule_provenance"] = manifest["baseline_schedule_provenance"]
+    return evidence
+
+
+def _assert_historical_run_inputs_stable(
+    prepared: PreparedToolRequest,
+    context: ToolExecutionContext,
+) -> None:
+    if (
+        _sha256_file(prepared.runtime["specification_path"])
+        != prepared.runtime["specification_sha256"]
+    ):
+        raise ToolInputConflictError(
+            "Historical-study specification changed after input resolution"
+        )
+    baseline_path = prepared.runtime.get("baseline_bundle_path")
+    if not isinstance(baseline_path, Path):
+        return
+    entries, references = _baseline_bundle_snapshot(
+        baseline_path,
+        context,
+        role="research_baseline_bundle_input",
+    )
+    if entries != list(prepared.runtime["baseline_bundle_entries"]):
+        raise ToolInputConflictError(
+            "Historical-study baseline bundle inventory changed after input resolution"
+        )
+    expected = [
+        item.to_dict()
+        for item in prepared.input_artifacts
+        if item.role == "research_baseline_bundle_input"
+    ]
+    if [item.to_dict() for item in references] != expected:
+        raise ToolInputConflictError(
+            "Historical-study baseline bundle changed after input resolution"
+        )
 
 
 def _execute_run(prepared: PreparedToolRequest, context: ToolExecutionContext) -> ToolResult:
     database_path = prepared.runtime["database_path"]
     barrier = prepared.runtime["database_read_barrier"]
     barrier.assert_held()
+    _assert_historical_run_inputs_stable(prepared, context)
     if _sha256_file(database_path) != prepared.runtime["database_sha256"]:
         raise RuntimeError("Database changed after input resolution and before execution")
     database = Database(f"sqlite+pysqlite:///{database_path.as_posix()}")
@@ -820,6 +1673,7 @@ def _execute_run(prepared: PreparedToolRequest, context: ToolExecutionContext) -
             prepared.runtime["specification"],
         )
         barrier.assert_held()
+        _assert_historical_run_inputs_stable(prepared, context)
         if _sha256_file(database_path) != prepared.runtime["database_sha256"]:
             raise RuntimeError("Database changed during deterministic analytical reads")
         paths = write_historical_study_bundle(
@@ -1139,7 +1993,9 @@ def _failure(
         output_artifacts=(),
         warnings=(),
         limitations=(
-            _EVALUATION_LIMITATIONS
+            _BASELINE_LIMITATIONS
+            if prepared.request.tool_name.startswith("research_baseline.")
+            else _EVALUATION_LIMITATIONS
             if prepared.request.tool_name.startswith("research_")
             else HISTORICAL_STUDY_LIMITATIONS
         ),
@@ -1153,6 +2009,9 @@ def _unprepared_failure(
     category: FailureCategory,
     code: str,
     message: str,
+    *,
+    limitations: tuple[str, ...] = (),
+    evidence: Mapping[str, Any] | None = None,
 ) -> ToolResult:
     return ToolResult(
         tool_name=request.tool_name,
@@ -1164,9 +2023,9 @@ def _unprepared_failure(
         input_artifacts=(),
         output_artifacts=(),
         warnings=(),
-        limitations=(),
+        limitations=limitations,
         errors=(ToolError(category=category, code=code, message=message),),
-        evidence={},
+        evidence={} if evidence is None else evidence,
     )
 
 
@@ -1174,11 +2033,34 @@ _PATH_SCHEMA = {"type": "string", "format": "safe-relative-path"}
 _RUN_SCHEMA = {
     "additionalProperties": False,
     "properties": {
+        "baseline_bundle": _PATH_SCHEMA,
         "database": _PATH_SCHEMA,
         "output": _PATH_SCHEMA,
         "specification": _PATH_SCHEMA,
     },
     "required": ["database", "output", "specification"],
+    "type": "object",
+}
+_NULLABLE_DATABASE_SCHEMA = {
+    "anyOf": [_PATH_SCHEMA, {"type": "null"}],
+}
+_BASELINE_GENERATE_SCHEMA = {
+    "additionalProperties": False,
+    "properties": {
+        "database": _NULLABLE_DATABASE_SCHEMA,
+        "output": _PATH_SCHEMA,
+        "specification": _PATH_SCHEMA,
+    },
+    "required": ["database", "output", "specification"],
+    "type": "object",
+}
+_BASELINE_VERIFY_SCHEMA = {
+    "additionalProperties": False,
+    "properties": {
+        "bundle": _PATH_SCHEMA,
+        "database": _NULLABLE_DATABASE_SCHEMA,
+    },
+    "required": ["bundle", "database"],
     "type": "object",
 }
 _VERIFY_SCHEMA = {
@@ -1229,6 +2111,36 @@ DEFAULT_REGISTRY = ResearchToolRegistry(
             validator=_validate_verify,
             resolver=_resolve_verify,
             executor=_execute_verify,
+        ),
+        ToolDefinition(
+            name="research_baseline.generate",
+            schema_version=1,
+            summary=(
+                "Generate one allowlisted deterministic baseline bundle and attest its "
+                "declared source authority."
+            ),
+            authority=(
+                "wartosc_perp_research.research.generate_baseline, "
+                "write_baseline_bundle, and attest_baseline_origin"
+            ),
+            request_schema=_BASELINE_GENERATE_SCHEMA,
+            validator=_validate_baseline_generate,
+            resolver=_resolve_baseline_generate,
+            executor=_execute_baseline_generate,
+            cache_validator=_cached_baseline_generation_is_current,
+        ),
+        ToolDefinition(
+            name="research_baseline.verify",
+            schema_version=1,
+            summary=("Verify a closed baseline bundle and independently attest its source origin."),
+            authority=(
+                "wartosc_perp_research.research.load_baseline_bundle and attest_baseline_origin"
+            ),
+            request_schema=_BASELINE_VERIFY_SCHEMA,
+            validator=_validate_baseline_verify,
+            resolver=_resolve_baseline_verify,
+            executor=_execute_baseline_verify,
+            cache_validator=_cached_baseline_verification_is_current,
         ),
         ToolDefinition(
             name="research_evaluation.verify",

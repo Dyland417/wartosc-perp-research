@@ -65,7 +65,16 @@ actual hourly exchange-event observations, begin flat, fail on incomplete eviden
 only at the first declared native decision boundary at or after exact event-time information
 availability. Logical hourly slots remain separate coverage identities and never replace exchange
 timestamps. These are research controls, not executable strategies, rankings, or evidence of
-profitability. Registry/session exposure and comparative benchmark orchestration remain deferred.
+profitability.
+
+Phase 5 checkpoint 3B advances the closed tool catalog to `1.2.0` with
+`research_baseline.generate` and `research_baseline.verify`. Funding baselines are independently
+requeried from an authoritative SQLite snapshot under the same consistent-read boundary used for
+their operational hash; flat and static controls explicitly report that the database was not
+consulted. A schema-v1 study may optionally bind the exact attested schedule and every file in the
+closed five-artifact baseline bundle. Existing schema-v1 studies without this provenance extension
+remain byte-compatible. Sessions treat the verified bundle and database snapshot as resolved
+inputs, so unchanged retries append nothing and changed evidence creates a new attempt.
 
 Variational, Lighter, and Binance remain disabled extension points. There is no order execution.
 
@@ -128,6 +137,7 @@ src/wartosc_perp_research/
   research/price_export.py             deterministic price exports and coverage manifests
   research/baselines.py                strict baseline contracts, generators, bundles, verifier
   research/baseline_repository.py      actual-funding evidence reads with ingestion lineage
+  research/baseline_attestation.py     independent origin requery and provenance identities
   backtests/engine.py                   event clock and Decimal position/cash ledger
   backtests/scenario.py                 strict versioned JSON scenario loading
   backtests/report.py                   deterministic simulation reports and manifests
@@ -167,10 +177,21 @@ with missing or invalid evidence reports `needs_data`, exits `1`, and writes no 
 
 `target-schedule.json` is accepted unchanged by the existing schedule parser, assembler, and
 historical-study pipeline. It contains target decisions only: fills, candle prices, latency,
-spread, slippage, fees, and marking remain explicit downstream assumptions. Full independent
-attestation that a historical study was regenerated from a particular baseline evidence bundle is
-deferred to checkpoint 3B; the current study hashes the exact schedule document, whose intent notes
-retain the baseline analytical and source identities.
+spread, slippage, fees, and marking remain explicit downstream assumptions. The standalone
+baseline CLI verifies internal five-file consistency. The registered schema-v1 baseline tools add
+independent origin attestation: funding generation and verification require an authoritative
+database, while controls reject one and report `database_consulted: false`.
+
+An origin-attested historical-study invocation must supply the baseline bundle, a study containing
+the typed provenance extension, and byte-identical canonical schedule content. The adapter rechecks
+internal integrity, independently requeries funding evidence under a consistent SQLite read
+boundary, and binds all five baseline artifact hashes. Schedule substitution, partial provenance,
+changed database bytes, and stale attestations fail closed. Portable market-evidence identity,
+portable source-lineage identity, and the operational database-byte identity remain separate.
+Origin attestation currently requires a sidecar-free rollback-journal SQLite snapshot; WAL journal
+mode is unsupported because acquiring the read barrier can materialize WAL/SHM sidecars.
+Unsigned SHA-256 evidence still does not prove who created the database or defend against a party
+that can replace both the source database and every artifact.
 
 For funding-driven decisions, the bundle records four distinct times: the original exchange event
 time, its logical hourly coverage slot, the information-availability time (equal to the unmodified
